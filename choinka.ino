@@ -1,37 +1,38 @@
+// Node ID: 635036282
 #include "painlessMesh.h"
+#include "mash_parameter.h"
 
-#define   MESH_PREFIX     "kennet"
-#define   MESH_PASSWORD   "kennet123"
-#define   MESH_PORT       5555
-
-Scheduler userScheduler; 
+Scheduler userScheduler;
 painlessMesh  mesh;
 
-void receivedCallback( uint32_t from, String &msg ) {
 
+void receivedCallback( uint32_t from, String &msg ) {
   String str1 = msg.c_str();
-  String str2 = "fito";
+  String str2 = "tomat0";
+  String str3 = "tomat1";
 
   if (str1.equals(str2)) {
-    String x = "H9" + String(analogRead(A0)); 
-    mesh.sendSingle(624409705,x);
+    digitalWrite(4, LOW);
+  }
+
+  if (str1.equals(str3)) {
+    digitalWrite(4, HIGH);
   }
 }
 
 void setup() {
-  pinMode(A0, INPUT); 
-
-  Serial.begin(9600); 
-
+  Serial.begin(115200);
+  
   mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
   mesh.onReceive(&receivedCallback);
+
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  delay(5);
+  digitalWrite(4, LOW);
 }
 
 void loop() {
-
   mesh.update();
 
-  Serial.println (analogRead(A0)); 
 }
-
-
