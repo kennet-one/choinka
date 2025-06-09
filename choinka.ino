@@ -8,7 +8,7 @@ painlessMesh  mesh;
 const uint8_t    SENSOR_PIN   = A0;
 const int        DRY_VALUE    = 1023;                       
 const int        WET_VALUE    = 0; 
-const int        THRESHOLD   = 13;    // поріг вологості
+const int        THRESHOLD   = 15;    // поріг вологості
 
 void receivedCallback( uint32_t from, String &msg ) {
 
@@ -28,7 +28,7 @@ Task taskTurnOffRelay(
 );
 
 Task taskReadSensor(
-  3600000,                    // через час
+  600000,                    // через 10 мін
   TASK_FOREVER,            // нескінченно
   []() {
     int raw = analogRead(SENSOR_PIN);                      // 0…1023
@@ -41,7 +41,7 @@ Task taskReadSensor(
       //Serial.println("🌱 Вологості замало — вмикаю реле та запускаю таймер на вимкнення");
       digitalWrite(4, HIGH);
       taskTurnOffRelay.restart();
-      taskTurnOffRelay.enableDelayed(3000);
+      taskTurnOffRelay.enableDelayed(2000);
     }
   },
   &userScheduler
