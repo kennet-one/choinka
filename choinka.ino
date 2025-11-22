@@ -5,76 +5,104 @@
 Scheduler userScheduler;
 painlessMesh  mesh;
 
-const uint8_t    SENSOR_PIN   = A0;
-const int        DRY_VALUE    = 1023;                       
-const int        WET_VALUE    = 0; 
-const int        THRESHOLD   = 23;    // поріг вологості
+// ----- Піни ESP8266 -----
+const uint8_t LEVEL_PIN = 5;   // D1 на NodeMCU: контакт "бак повний" -> GND
+const uint8_t PUMP_PIN  = 4;   // D2 на NodeMCU: реле / MOSFET помпи
 
-void receivedCallback( uint32_t from, String &msg ) {
+// ----- Таймінги -----
+const unsigned long CHECK_PERIOD = 500;    // як часто перевіряти рівень, мс
+const unsigned long MAX_PUMP_TIME = 60000; // макс. час безперервної роботи помпи, мс
 
-  if (msg == "tomat0") feedback();
+bool pumpIsOn = false;
+
+// ----- Прототипи -----
+void feedback();
+void checkLevel();
+void turnOffPump();
+void receivedCallback(uint32_t from, String &msg);
+
+// ----- Таски -----
+Task taskCheckLevel(CHECK_PERIOD, TASK_FOREVER, &checkLevel);
+Task taskTurnOffPump(MAX_PUMP_TIME, TASK_ONCE, &turnOffPump);
+
+// повертає 0 або 100, щоб залишити старий формат tomat0
+int readLevelPercent() {
+	bool isFull = (digitalRead(LEVEL_PIN) == LOW); // LOW = замкнуто на GND = бак повний
+	return isFull ? 100 : 0;
 }
 
-int readsens () {
-  int raw = analogRead(SENSOR_PIN);                      // 0…1023
-  int pct = map(raw, DRY_VALUE, WET_VALUE, 0, 100);      // конвертуємо у % вологості
-  pct = constrain(pct, 0, 100);
+// відправка стану бака на центральні ноди
+void feedback() {
+	int pct = readLevelPercent();
+	String msg = "tomat0=";
+	msg += pct;
 
-  return pct;
+	// сюди підстав ті ID, які в тебе реально є в мережі
+	mesh.sendSingle(624409705, msg);
+	mesh.sendSingle(1127818912, msg);
 }
 
-void feedback () {
-  int pctt = readsens();
-  String pct = "tomat0=";
-  pct += pctt;
-  mesh.sendSingle(624409705,pct);
-  mesh.sendSingle(1127818912,pct);
+// основна логіка автополиву
+void checkLevel() {
+	bool isFull = (digitalRead(LEVEL_PIN) == LOW);
+
+	// бак НЕ повний -> треба долити
+	if (!isFull) {
+		if (!pumpIsOn) {
+			pumpIsOn = true;
+			digitalWrite(PUMP_PIN, HIGH); // вмикаємо помпу
+			// запускаємо таймер безпеки
+			taskTurnOffPump.restartDelayed();
+		}
+	}
+	// бак повний
+	else {
+		if (pumpIsOn) {
+			turnOffPump();          // вимикаємо помпу
+			taskTurnOffPump.disable(); // таймер більше не потрібен
+		}
+	}
 }
 
-Task taskTurnOffRelay(
-  0,               
-  TASK_ONCE,          // одноразово
-  []() {
-    digitalWrite(4, LOW);   // вимикаємо (HIGH — залежить від того, активне LOW у тебе чи HIGH)
-    //Serial.println("gsdssf");
-  },
-  &userScheduler
-);
+// викликається, якщо помпа працює надто довго
+void turnOffPump() {
+	pumpIsOn = false;
+	digitalWrite(PUMP_PIN, LOW); // вимикаємо помпу
+}
 
-Task taskReadSensor(
-  600000,                    // через 10 мін
-  TASK_FOREVER,            // нескінченно
-  []() {
-    int pct = readsens();
-    Serial.println(pct);
-
-    if (pct < THRESHOLD) {
-      //Serial.println("🌱 Вологості замало — вмикаю реле та запускаю таймер на вимкнення");
-      digitalWrite(4, HIGH);
-      taskTurnOffRelay.restart();
-      taskTurnOffRelay.enableDelayed(2000);
-    }
-  },
-  &userScheduler
-);
+void receivedCallback(uint32_t from, String &msg) {
+	if (msg == "tomat0") {
+		feedback();
+	}
+}
 
 void setup() {
-  Serial.begin(115200);
-  
-  mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
-  mesh.onReceive(&receivedCallback);
+	Serial.begin(115200);
 
-  pinMode(4, OUTPUT);
-  digitalWrite(4, HIGH);
-  delay(5);
-  digitalWrite(4, LOW);
+	// Піни
+	pinMode(PUMP_PIN, OUTPUT);
+	digitalWrite(PUMP_PIN, LOW);      // помпа спочатку вимкнена
 
-  userScheduler.addTask(taskReadSensor);
-  userScheduler.addTask(taskTurnOffRelay);
-  
-  taskReadSensor.enable();
+	pinMode(LEVEL_PIN, INPUT_PULLUP); // контакт до GND = "бак повний"
+	// якщо підеш на інший пін без pull-up — додай зовнішній резистор 10–100 кОм на 3.3V
+
+	// Mesh
+	mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
+	mesh.onReceive(&receivedCallback);
+	// mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION); // якщо треба дебаг
+
+	// Таски
+	userScheduler.addTask(taskCheckLevel);
+	userScheduler.addTask(taskTurnOffPump);
+
+	taskCheckLevel.enable();
+
+	// короткий "блік" помпою / реле при старті
+	digitalWrite(PUMP_PIN, HIGH);
+	delay(200);
+	digitalWrite(PUMP_PIN, LOW);
 }
 
 void loop() {
-  mesh.update();
+	mesh.update();
 }
