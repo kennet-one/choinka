@@ -7,14 +7,16 @@ painlessMesh mesh;
 
 // -------- Піни ESP8266 --------
 const uint8_t LEVEL_A_PIN = 5;   // D1 -> через 100k на електрод 1 (+ ~1M на GND)
-const uint8_t LEVEL_B_PIN = 0;   // D3 -> через 100k на електрод 2 (+ ~1M на GND)
-const uint8_t PUMP_PIN    = 4;   // D2: реле / MOSFET помпи
+const uint8_t LEVEL_B_PIN = 4;   // D2 -> через 100k на електрод 2 (+ ~1M на GND)
+const uint8_t PUMP_PIN    = 14;  // D5: реле / MOSFET помпи (HIGH = помпа ON)
 
 // -------- Таймінги --------
-// Для тестів роблю коротку паузу, потім зможеш збільшити
-const unsigned long CHECK_PERIOD    = 60000;    // як часто перевіряти рівень, мс
-const unsigned long MAX_PUMP_TIME   = 2000;    // макс. час безперервної роботи помпи, мс
-const unsigned long MIN_PAUSE_TIME  = 60000;   // мін. пауза між поливами, мс (1 хв на тест)
+const unsigned long CHECK_PERIOD    = 1000;    // перевірка 1 раз/сек
+const unsigned long MAX_PUMP_TIME   = 3000;    // макс. 3 сек безперервної роботи помпи
+const unsigned long MIN_PAUSE_TIME  = 60000;   // 1 хв пауза між поливами (для тестів можна менше)
+
+// Поріг "води" по кількості HIGH з 10 вимірів
+const int WATER_THRESHOLD = 6;    // якщо >=6 з 10 HIGH -> вважаємо, що вода є
 
 // -------- Змінні стану --------
 bool          pumpIsOn         = false;
@@ -26,16 +28,15 @@ int           lastLevelPercent = 0;      // 0 або 100 для tomat0
 void feedback();
 void checkLevel();
 void receivedCallback(uint32_t from, String &msg);
-bool isWaterPresent();
-bool measureOnce(uint8_t drivePin, uint8_t sensePin, int &highCountOut);
+int  measureHighCount(uint8_t drivePin, uint8_t sensePin);
 
 // -------- Таск перевірки рівня --------
 Task taskCheckLevel(CHECK_PERIOD, TASK_FOREVER, &checkLevel);
 
 // ----------------------------------------------------
-// Вимірювання з AC-чергуванням
+// Вимірювання з AC-чергуванням на D1/D2
 // ----------------------------------------------------
-// D1 ---[100k]--- Е1 ~~~ вода ~~~ Е2 ---[100k]--- D3
+// D1 ---[100k]--- Е1 ~~~ вода ~~~ Е2 ---[100k]--- D2
 // На кожному піні ще ~1M до GND (підстроєчник).
 //
 // drivePin = OUTPUT HIGH
@@ -43,13 +44,9 @@ Task taskCheckLevel(CHECK_PERIOD, TASK_FOREVER, &checkLevel);
 //
 // Якщо вода Є -> через 100k + вода + 100k піднімає sensePin -> читаємо HIGH.
 // Якщо води НЕМає -> sensePin тягнеться своїм 1M до GND -> LOW.
-//
-// Щоб не ловити дрібну вологу / конденсат як "повний бак",
-// робимо 10 вимірів і вважаємо "вода є", тільки якщо
-// highCount достатньо великий (поріг можна крутити).
 // ----------------------------------------------------
 
-bool measureOnce(uint8_t drivePin, uint8_t sensePin, int &highCountOut) {
+int measureHighCount(uint8_t drivePin, uint8_t sensePin) {
 	// На старті обидва піни у hi-Z
 	pinMode(LEVEL_A_PIN, INPUT);
 	pinMode(LEVEL_B_PIN, INPUT);
@@ -58,7 +55,7 @@ bool measureOnce(uint8_t drivePin, uint8_t sensePin, int &highCountOut) {
 	pinMode(drivePin, OUTPUT);
 	digitalWrite(drivePin, HIGH);
 
-	// sensePin -> вхід, підтяжка до GND є в залізі (1M)
+	// sensePin -> вхід
 	pinMode(sensePin, INPUT);
 
 	delay(5); // дати стабілізуватись
@@ -67,7 +64,7 @@ bool measureOnce(uint8_t drivePin, uint8_t sensePin, int &highCountOut) {
 	int highCount = 0;
 
 	for (int i = 0; i < samples; i++) {
-		int v = digitalRead(sensePin); // 1 = вода (добра провідність), 0 = сухо
+		int v = digitalRead(sensePin); // 1 = вода, 0 = сухо
 		if (v == HIGH) {
 			highCount++;
 		}
@@ -77,50 +74,37 @@ bool measureOnce(uint8_t drivePin, uint8_t sensePin, int &highCountOut) {
 	// Відпускаємо drivePin назад в hi-Z
 	pinMode(drivePin, INPUT);
 
-	highCountOut = highCount;
-
-	// Поріг чутливості:
-	// якщо вода справді є, очікуємо 8-10 HIGH із 10.
-	// Якщо лише трохи волога / соляна плівка -> буде менше.
-	bool water = (highCount >= 6);
-
-	Serial.print("measureOnce drive=");
-	Serial.print(drivePin);
-	Serial.print(" sense=");
-	Serial.print(sensePin);
-	Serial.print(" highCount=");
-	Serial.print(highCount);
-	Serial.print(" -> water=");
-	Serial.println(water ? "YES" : "NO");
-
-	return water;
+	return highCount;
 }
 
-// Чергуємо A->B, B->A, щоб міняти полярність
-bool isWaterPresent() {
-	int highA = 0, highB = 0;
+// ----------------------------------------------------
+// Основна логіка визначення "вода/сухо" (обидва датчики)
+// ----------------------------------------------------
+void getWaterState(bool &anyWater, bool &allDry) {
+	int highAB = measureHighCount(LEVEL_A_PIN, LEVEL_B_PIN); // D1 -> 3.3V, D2 міряє
+	int highBA = measureHighCount(LEVEL_B_PIN, LEVEL_A_PIN); // D2 -> 3.3V, D1 міряє
 
-	bool w1 = measureOnce(LEVEL_A_PIN, LEVEL_B_PIN, highA); // D1 дає 3.3V, D3 міряє
-	bool w2 = measureOnce(LEVEL_B_PIN, LEVEL_A_PIN, highB); // D3 дає 3.3V, D1 міряє
+	bool waterAB = (highAB >= WATER_THRESHOLD);
+	bool waterBA = (highBA >= WATER_THRESHOLD);
 
-	// Вода є, якщо в ОБОХ напрямках сигнал досить сильний.
-	bool water = (w1 && w2);
+	anyWater = (waterAB || waterBA);          // хоч один каже "вода"
+	allDry   = (!waterAB && !waterBA);        // обидва кажуть "сухо"
 
-	Serial.print("isWaterPresent(): w1=");
-	Serial.print(w1 ? "YES" : "NO");
-	Serial.print(" (highA=");
-	Serial.print(highA);
-	Serial.print(")  w2=");
-	Serial.print(w2 ? "YES" : "NO");
-	Serial.print(" (highB=");
-	Serial.print(highB);
-	Serial.print(")  -> water=");
-	Serial.println(water ? "YES" : "NO");
-
-	return water;
+	Serial.print("getWaterState(): highAB=");
+	Serial.print(highAB);
+	Serial.print(" (");
+	Serial.print(waterAB ? "WATER" : "DRY");
+	Serial.print(")  highBA=");
+	Serial.print(highBA);
+	Serial.print(" (");
+	Serial.print(waterBA ? "WATER" : "DRY");
+	Serial.print(")  -> anyWater=");
+	Serial.print(anyWater ? "YES" : "NO");
+	Serial.print("  allDry=");
+	Serial.println(allDry ? "YES" : "NO");
 }
 
-// Повертає останній відомий відсоток (0 або 100) для сумісності з tomat0
+// Повертає 0 або 100 для сумісності з tomat0
 int readLevelPercent() {
 	return lastLevelPercent;
 }
@@ -143,31 +127,50 @@ void feedback() {
 // Основна логіка автополиву
 // ----------------------------------------------------
 void checkLevel() {
-	unsigned long now   = millis();
-	bool         isFull = isWaterPresent();  // вода дійшла до електродів = "рівень ОК / повний"
+	unsigned long now = millis();
 
+	bool anyWater = false;
+	bool allDry   = false;
+	getWaterState(anyWater, allDry);
+
+	// isFull = бак вважаємо повним, якщо ХОЧ ДЕ-НЕБУДЬ бачимо воду
+	bool isFull = anyWater;
 	lastLevelPercent = isFull ? 100 : 0;
 
-	// Якщо помпа вже вмикнена – стежимо за таймаутом і рівнем
+	Serial.print("checkLevel(): isFull=");
+	Serial.print(isFull ? "YES" : "NO");
+	Serial.print("  pumpIsOn=");
+	Serial.print(pumpIsOn ? "YES" : "NO");
+	Serial.print("  now=");
+	Serial.print(now);
+	Serial.print("  lastWater=");
+	Serial.print(lastWater);
+	Serial.print("  dtSinceLastWater=");
+	Serial.println(now - lastWater);
+
+	// --------- Якщо помпа ВЖЕ увімкнена ---------
 	if (pumpIsOn) {
-		// Аварійне відключення, якщо щось пішло не так (датчик здох, шланг злетів і т.п.)
+		// Аварійне відключення, якщо щось пішло не так
 		if (now - pumpStart > MAX_PUMP_TIME) {
 			Serial.println("Pump TIMEOUT -> OFF");
 			pumpIsOn = false;
 			digitalWrite(PUMP_PIN, LOW);
-			lastWater = now;  // вважаємо, що робили спробу поливу
+			lastWater = now;
 			return;
 		}
 
-		// Якщо бачимо, що рівень досягнутий – вимикаємо помпу
-		if (isFull) {
-			Serial.println("Level OK -> pump OFF");
+		// Якщо ДЕ-НЕБУДЬ бачимо воду – виключаємо помпу (щоб не перелити)
+		if (anyWater) {
+			Serial.println("Any sensor sees WATER -> pump OFF");
 			pumpIsOn = false;
 			digitalWrite(PUMP_PIN, LOW);
 			lastWater = now;
 		}
+
 		return;
 	}
+
+	// --------- Помпа ВИМКНЕНА – вирішуємо, чи запускати ---------
 
 	// 1. Не поливаємо занадто часто
 	if (now - lastWater < MIN_PAUSE_TIME) {
@@ -175,14 +178,14 @@ void checkLevel() {
 		return;
 	}
 
-	// 2. Якщо рівень НЕ повний (води мало біля датчика) – запускаємо помпу
-	if (!isFull) {
-		Serial.println("Level LOW -> pump ON");
+	// 2. Включаємо помпу ТІЛЬКИ якщо ОБИДВА кажуть "сухо"
+	if (allDry) {
+		Serial.println("Both sensors DRY -> pump ON");
 		pumpIsOn  = true;
 		pumpStart = now;
 		digitalWrite(PUMP_PIN, HIGH);
 	} else {
-		Serial.println("Level still FULL, no watering.");
+		Serial.println("Not all sensors DRY yet, no watering.");
 	}
 }
 
@@ -207,29 +210,41 @@ void setup() {
 	Serial.begin(115200);
 	delay(200);
 
-	// Піна помпи
+	Serial.println();
+	Serial.println("=== Mint auto-watering node (ESP8266, D1/D2 sensor, D5 pump) start ===");
+
 	pinMode(PUMP_PIN, OUTPUT);
 	digitalWrite(PUMP_PIN, LOW);  // помпа спочатку вимкнена
 
-	// Піни рівня – у високому опорі, все робимо в measureOnce()
 	pinMode(LEVEL_A_PIN, INPUT);
 	pinMode(LEVEL_B_PIN, INPUT);
 
-	// Mesh
+	Serial.println("Pins configured. Initial states:");
+	Serial.print("LEVEL_A_PIN = ");
+	Serial.println(LEVEL_A_PIN);
+	Serial.print("LEVEL_B_PIN = ");
+	Serial.println(LEVEL_B_PIN);
+	Serial.print("PUMP_PIN    = ");
+	Serial.println(PUMP_PIN);
+
 	mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
 	mesh.onReceive(&receivedCallback);
 
-	// Таски
+	Serial.println("Mesh initialized.");
+
+	userScheduler.addTask(taskCheckLevel);
 	userScheduler.addTask(taskCheckLevel);
 	taskCheckLevel.enable();
 
-	// стартові значення, щоб при запуску можна було одразу поливати, якщо треба
+	// щоб одразу можна було полити, якщо треба
 	lastWater = millis() - MIN_PAUSE_TIME;
 
-	// Короткий "блік" реле при старті (видно, що живе)
+	Serial.println("Blink pump relay.");
 	digitalWrite(PUMP_PIN, HIGH);
 	delay(200);
 	digitalWrite(PUMP_PIN, LOW);
+
+	Serial.println("Setup done.");
 }
 
 // ----------------------------------------------------
