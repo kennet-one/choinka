@@ -15,6 +15,8 @@
 #include "nvs_flash.h"
 
 #include "legacy_proto.h"
+#include "pump_node.h"
+
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -257,7 +259,7 @@ static esp_err_t mesh_comm_start(void)
 		started = true;
 		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
-        xTaskCreate(stack_monitor_task, "stack_mon", 4096, NULL, 3, NULL);
+        xTaskCreate(stack_monitor_task, "stack_mon", 4096, NULL, 3, NULL);	
 	}
 	return ESP_OK;
 }
@@ -517,5 +519,14 @@ void app_main(void)
 	         esp_mesh_get_topology(),
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
+			 
+		// -------- Підключення вузла помпи --------
+	pump_node_pins_t pump_pins = {
+		.level_a_gpio = GPIO_NUM_32,   // LEVEL_A_PIN
+		.level_b_gpio = GPIO_NUM_33,   // LEVEL_B_PIN
+		.pump_gpio    = GPIO_NUM_26,   // PUMP_PIN
+	};
 
+	ESP_ERROR_CHECK(pump_node_init(&pump_pins));
+	pump_node_start_task(5);          ///prio як тобі ок
 }
