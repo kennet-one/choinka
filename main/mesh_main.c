@@ -78,66 +78,8 @@ static void ip_event_handler(void *arg,
                              int32_t event_id,
                              void *event_data);
 
-static void mesh_tx_task(void *arg);
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
-
-/* -------------------------------------------------------------------------- */
-/*  TX task – періодично шлемо пакет на root                                  */
-/* -------------------------------------------------------------------------- */
-
-static void mesh_tx_task(void *arg)
-{
-	mesh_packet_t pkt;
-	mesh_data_t   data;
-	mesh_addr_t   dest;
-	esp_err_t     err;
-	uint32_t      counter = 0;
-
-	data.data  = (uint8_t *)&pkt;
-	data.proto = MESH_PROTO_BIN;
-	data.tos   = MESH_TOS_P2P;
-
-	while (is_running) {
-		vTaskDelay(pdMS_TO_TICKS(TX_INTERVAL_MS));
-
-		// Шлемо тільки, якщо ми підключені до mesh і ми НЕ root
-		if (!is_mesh_connected || esp_mesh_is_root()) {
-			continue;
-		}
-
-		counter++;
-
-		memset(&pkt, 0, sizeof(pkt));
-		pkt.magic   = MESH_PKT_MAGIC;
-		pkt.version = MESH_PKT_VERSION;
-		pkt.type    = MESH_PKT_TYPE_TEXT;
-		pkt.counter = counter;
-
-		// MAC цієї ноди (STA інтерфейс)
-		esp_wifi_get_mac(WIFI_IF_STA, pkt.src_mac);
-
-		snprintf(pkt.payload, sizeof(pkt.payload),
-		         "Hello %lu", (unsigned long)counter);
-
-		data.size = sizeof(pkt);
-
-		// 00:00:00:00:00:00 => "відправити на root"
-		memset(&dest, 0, sizeof(dest));
-
-		err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
-		if (err == ESP_OK) {
-			ESP_LOGI(MESH_TAG,
-			         "TX -> ROOT: cnt=%lu, payload=\"%s\"",
-			         (unsigned long)counter, pkt.payload);
-		} else {
-			ESP_LOGE(MESH_TAG,
-			         "esp_mesh_send failed: 0x%x (%s)",
-			         err, esp_err_to_name(err));
-		}
-	}
-	vTaskDelete(NULL);
-}
 
 /* -------------------------------------------------------------------------- */
 /*  RX task – слухаємо пакети від інших нод                                   */
@@ -210,7 +152,6 @@ static esp_err_t mesh_comm_start(void)
 
 	if (!started) {
 		started = true;
-		xTaskCreate(mesh_tx_task, "mesh_tx", 4096, NULL, 5, NULL);
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
         stack_monitor_start(3);
 	}
@@ -481,5 +422,5 @@ void app_main(void)
 	};
 
 	ESP_ERROR_CHECK(pump_node_init(&pump_pins));
-	pump_node_start_task(5);          ///prio як тобі ок
+	pump_node_start_task(5);          
 }
