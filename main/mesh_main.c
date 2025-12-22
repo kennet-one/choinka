@@ -20,6 +20,7 @@
 #include "log_time_vprintf.h"
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
+#include "mesh_log_stream.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -71,65 +72,82 @@ static esp_err_t mesh_comm_start(void);
 
 static void mesh_rx_task(void *arg)
 {
-	mesh_packet_t pkt;
-	mesh_data_t   data;
-	mesh_addr_t   from;
-	int           flag;
-	esp_err_t     err;
+	uint8_t		rx_buf[256];
 
-	data.data = (uint8_t *)&pkt;
-	data.size = sizeof(pkt);
+	mesh_data_t	data = {
+		.data	= rx_buf,
+		.size	= sizeof(rx_buf),
+	};
+
+	mesh_addr_t	from;
+	int		flag = 0;
+	esp_err_t	err;
 
 	while (is_running) {
-		data.size = sizeof(pkt);
+		data.size = sizeof(rx_buf);
+
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
-			ESP_LOGE(MESH_TAG,
-			         "esp_mesh_recv failed: 0x%x (%s)",
-			         err, esp_err_to_name(err));
-			continue;
-		}
-		if (data.size < sizeof(mesh_packet_t)) {
-			ESP_LOGW(MESH_TAG,
-			         "RX short packet: %d bytes", data.size);
+			ESP_LOGE(MESH_TAG, "esp_mesh_recv failed: 0x%x (%s)", err, esp_err_to_name(err));
 			continue;
 		}
 
-		// Перевіряємо, що це "наш" формат
-		if (pkt.magic != MESH_PKT_MAGIC || pkt.version != MESH_PKT_VERSION) {
-			ESP_LOGW(MESH_TAG,
-			         "RX unknown packet from " MACSTR,
-			         MAC2STR(from.addr));
+		if (data.size < sizeof(mesh_pkt_hdr_t)) {
+			ESP_LOGW(MESH_TAG, "RX too short: %d bytes", (int)data.size);
 			continue;
 		}
 
-		if (pkt.type == MESH_TIME_SYNC_TYPE_TIME) {
-			mesh_time_sync_handle_rx(&pkt, data.size);
+		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
+
+		// не наш протокол? ігноруємо
+		if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION) {
+			ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " (%d bytes)", MAC2STR(from.addr), (int)data.size);
 			continue;
 		}
 
-		if (pkt.type == MESH_PKT_TYPE_TEXT) {
-			// Гарантуємо, що payload закінчується '\0'
-			pkt.payload[sizeof(pkt.payload) - 1] = '\0';
-			ESP_LOGI(MESH_TAG,
-			         "RX TEXT: cnt=%lu from " MACSTR
-			         " (src_mac=" MACSTR "), payload=\"%s\"",
-			         (unsigned long)pkt.counter,
-			         MAC2STR(from.addr),
-			         MAC2STR(pkt.src_mac),
-			         pkt.payload);
-            legacy_handle_text(pkt.payload);
-
-		} else {
-			ESP_LOGI(MESH_TAG,
-			         "RX type=%u cnt=%lu from " MACSTR,
-			         pkt.type,
-			         (unsigned long)pkt.counter,
-			         MAC2STR(from.addr));
+		// диспетчер типів
+		if (h->type == MESH_TIME_SYNC_TYPE_TIME) {
+			mesh_time_sync_handle_rx(rx_buf, data.size);
+			continue;
 		}
+
+		if (h->type == MESH_LOG_TYPE_CTRL) {
+			mesh_log_stream_handle_rx(rx_buf, data.size);
+			continue;
+		}
+
+		if (h->type == MESH_PKT_TYPE_TEXT) {
+			if (data.size < sizeof(mesh_packet_t)) {
+				ESP_LOGW(MESH_TAG, "RX TEXT short: %d bytes", (int)data.size);
+				continue;
+			}
+
+			const mesh_packet_t *p = (const mesh_packet_t *)rx_buf;
+
+			// гарантуємо '\0'
+			char payload[sizeof(p->payload)];
+			memcpy(payload, p->payload, sizeof(payload));
+			payload[sizeof(payload) - 1] = '\0';
+
+			ESP_LOGI(MESH_TAG, "RX TEXT from " MACSTR " (src=" MACSTR "): \"%s\"",
+				MAC2STR(from.addr),
+				MAC2STR(p->src_mac),
+				payload
+			);
+
+			// <-- ОЦЕ МІСЦЕ: якщо в тебе не legacy_handle_text(), заміни на свій handler
+			legacy_handle_text(payload);
+
+			continue;
+		}
+
+		ESP_LOGI(MESH_TAG, "RX type=%u from " MACSTR " (%d bytes)",
+			(unsigned)h->type, MAC2STR(from.addr), (int)data.size);
 	}
+
 	vTaskDelete(NULL);
 }
+
 
 /* -------------------------------------------------------------------------- */
 /*  Запуск задач TX/RX один раз                                               */
@@ -228,6 +246,8 @@ static void mesh_event_handler(void *arg,
 		esp_mesh_get_id(&id);
 		mesh_layer = conn->self_layer;
 		memcpy(mesh_parent_addr.addr, conn->connected.bssid, 6);
+
+		mesh_log_stream_on_mesh_connected();
 
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_PARENT_CONNECTED> layer:%d -> %d, parent:" MACSTR
@@ -391,4 +411,5 @@ void app_main(void)
 	pump_node_start_task(5);     
 	mesh_time_sync_init();
 	log_time_vprintf_start();     
+	mesh_log_stream_init(MESH_TAG);
 }
