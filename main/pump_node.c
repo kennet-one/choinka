@@ -17,7 +17,7 @@
 
 static const char *TAG = "pump_node";
 
-/* Твої таймінги й пороги з Arduino-коду */
+/*  таймінги й пороги */
 
 #define CHECK_PERIOD_MS			1000UL		// раз на секунду
 #define MAX_PUMP_TIME_MS		3000UL		// помпа максимум 3 c
@@ -31,6 +31,10 @@ static const char *TAG = "pump_node";
 
 #define ADC_VREF				3.3f
 #define ADC_MAX_RAW				4095.0f		// 12-біт
+
+/* ---- Захист: якщо ОБИДВА напрямки ≈ 0V — НЕ поливаємо ---- */
+#define ZERO_VOLTAGE			0.02f		// 20мВ ~ "реально 0"
+#define ZERO_CONFIRM_CYCLES		3			// скільки циклів підряд, щоб вважати fault
 
 /* Для класичного ESP32: GPIO32->ADC1_CH4, GPIO33->ADC1_CH5 */
 #define PUMP_ADC_UNIT			ADC_UNIT_1
@@ -63,6 +67,9 @@ typedef struct {
 	bool		stored_is_full;
 	uint8_t		dry_streak;
 	uint8_t		wet_streak;
+
+	// fault: обидва виміри ~0V
+	uint8_t		zero_streak;
 
 	int			last_level_percent;
 } pump_ctx_t;
@@ -143,8 +150,9 @@ static float measure_voltage(bool drive_a)
  * Читаємо обидва напрями й отримуємо:
  * any_water = хоч один напрям явно "мокрий"
  * all_dry   = обидва напрями явно "сухі"
+ * all_zero  = обидва напрями ≈ 0V (fault / обрив / не той пін / ADC=0)
  */
-static void get_water_state(bool *any_water, bool *all_dry)
+static void get_water_state(bool *any_water, bool *all_dry, bool *all_zero)
 {
 	float u_ab = measure_voltage(true);		// A -> 3.3V, міряємо B
 	float u_ba = measure_voltage(false);	// B -> 3.3V, міряємо A
@@ -157,11 +165,15 @@ static void get_water_state(bool *any_water, bool *all_dry)
 	bool dry_ab   = (s_ab == WATER_DRY);
 	bool dry_ba   = (s_ba == WATER_DRY);
 
+	bool zero_ab = (!isnan(u_ab) && (u_ab <= ZERO_VOLTAGE));
+	bool zero_ba = (!isnan(u_ba) && (u_ba <= ZERO_VOLTAGE));
+
 	*any_water = (water_ab || water_ba);
 	*all_dry   = (dry_ab   && dry_ba);
+	*all_zero  = (zero_ab  && zero_ba);
 
 	ESP_LOGI(TAG,
-	         "getWaterState(): U_AB=%.3fV(%s)  U_BA=%.3fV(%s)  anyWater=%s allDry=%s",
+	         "getWaterState(): U_AB=%.3fV(%s)  U_BA=%.3fV(%s)  anyWater=%s allDry=%s allZero=%s",
 	         u_ab,
 	         s_ab == WATER_WET ? "WET" :
 	         s_ab == WATER_DRY ? "DRY" : "UNK",
@@ -169,7 +181,8 @@ static void get_water_state(bool *any_water, bool *all_dry)
 	         s_ba == WATER_WET ? "WET" :
 	         s_ba == WATER_DRY ? "DRY" : "UNK",
 	         *any_water ? "YES" : "NO",
-	         *all_dry   ? "YES" : "NO");
+	         *all_dry   ? "YES" : "NO",
+	         *all_zero  ? "YES" : "NO");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -182,9 +195,35 @@ static void pump_step(void)
 
 	bool any_water = false;
 	bool all_dry   = false;
-	get_water_state(&any_water, &all_dry);
+	bool all_zero  = false;
+	get_water_state(&any_water, &all_dry, &all_zero);
 
-	// оновлюємо стріки
+	// ---- Обробка "all_zero" fault ----
+	if (all_zero) {
+		if (s_pump.zero_streak < 255) s_pump.zero_streak++;
+	} else {
+		s_pump.zero_streak = 0;
+	}
+
+	bool sensor_fault_zero = (s_pump.zero_streak >= ZERO_CONFIRM_CYCLES);
+
+	// Якщо fault — не даємо помпі стартувати (і бажано гасимо, якщо вона вже ON)
+	if (sensor_fault_zero) {
+		ESP_LOGW(TAG,
+		         "SENSOR FAULT: both directions ~0V for %u cycles -> inhibit watering",
+		         (unsigned)s_pump.zero_streak);
+
+		// якщо помпа вже ON — вимикаємо з безпеки
+		if (s_pump.pump_on) {
+			ESP_LOGW(TAG, "Pump OFF due to sensor fault");
+			s_pump.pump_on = false;
+			gpio_set_level(s_pump.pump_gpio, 0);
+			s_pump.last_water_ms = now;		// щоб не дергало часто
+		}
+		return;
+	}
+
+	// оновлюємо стріки рівня (тільки якщо НЕ fault)
 	if (any_water) {
 		s_pump.wet_streak++;
 		s_pump.dry_streak = 0;
@@ -212,12 +251,13 @@ static void pump_step(void)
 	s_pump.last_level_percent = is_full ? 100 : 0;
 
 	ESP_LOGI(TAG,
-	         "checkLevel(): isFull=%s pumpOn=%s dtSinceLast=%lu wet=%u dry=%u",
+	         "checkLevel(): isFull=%s pumpOn=%s dtSinceLast=%lu wet=%u dry=%u zero=%u",
 	         is_full ? "YES" : "NO",
 	         s_pump.pump_on ? "YES" : "NO",
 	         (unsigned long)(now - s_pump.last_water_ms),
 	         (unsigned)s_pump.wet_streak,
-	         (unsigned)s_pump.dry_streak);
+	         (unsigned)s_pump.dry_streak,
+	         (unsigned)s_pump.zero_streak);
 
 	// ---- Якщо помпа ВЖЕ увімкнена ----
 	if (s_pump.pump_on) {
@@ -242,13 +282,13 @@ static void pump_step(void)
 
 	// ---- Помпа вимкнена – вирішуємо, чи запускати ----
 
-	// 1. Пауза між поливами
+	// 1) Пауза між поливами
 	if (now - s_pump.last_water_ms < MIN_PAUSE_MS) {
 		ESP_LOGI(TAG, "Too soon since last watering, skip.");
 		return;
 	}
 
-	// 2. Включаємо помпу, якщо НЕ full (LOW)
+	// 2) Включаємо помпу, якщо НЕ full
 	if (!is_full) {
 		ESP_LOGI(TAG, "Level LOW -> pump ON");
 		s_pump.pump_on = true;
@@ -280,6 +320,9 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 {
 	if (s_pump.inited) {
 		return ESP_OK;
+	}
+	if (!pins) {
+		return ESP_ERR_INVALID_ARG;
 	}
 
 	memset(&s_pump, 0, sizeof(s_pump));
@@ -320,6 +363,7 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	s_pump.stored_is_full = false;
 	s_pump.wet_streak     = 0;
 	s_pump.dry_streak     = DRY_CONFIRM_CYCLES;
+	s_pump.zero_streak    = 0;
 	s_pump.last_level_percent = 0;
 
 	// Легкий "блінк" помпою як у Arduino
