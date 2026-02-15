@@ -15,5 +15,6 @@
   "idf.espIdfPathWin": "C:\\Users\\kennet\\esp\\v5.5.1\\esp-idf",
   "idf.toolsPathWin": "C:\\Users\\kennet\\.espressif",
   "idf.pythonInstallPath": "C:\\Users\\kennet\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\Users\\kennet\\esp\\v5.5.1\\esp-idf"
 }

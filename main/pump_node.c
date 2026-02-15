@@ -11,13 +11,18 @@
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
 
+// adc калібрація
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+// adc калібрація
+
 /* -------------------------------------------------------------------------- */
 /*  Константи                                                                 */
 /* -------------------------------------------------------------------------- */
 
 static const char *TAG = "pump_node";
 
-/* Твої таймінги й пороги з Arduino-коду */
+/* таймінги й пороги  */
 
 #define CHECK_PERIOD_MS			1000UL		// раз на секунду
 #define MAX_PUMP_TIME_MS		3000UL		// помпа максимум 3 c
@@ -70,6 +75,11 @@ typedef struct {
 static pump_ctx_t					s_pump;
 static adc_oneshot_unit_handle_t	s_adc = NULL;
 
+// adc калібрація
+static adc_cali_handle_t	s_adc_cali = NULL;
+static bool					s_adc_cal_ok = false;
+// adc калібрація
+
 /* -------------------------------------------------------------------------- */
 /*  Хелпери часу / класифікації                                              */
 /* -------------------------------------------------------------------------- */
@@ -93,6 +103,53 @@ static water_state_t classify_voltage(float u)
 	return WATER_UNKNOWN;
 }
 
+// adc калібрація
+static void adc_try_init_calibration(void)
+{
+	s_adc_cali = NULL;
+	s_adc_cal_ok = false;
+
+	#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+	{
+		adc_cali_curve_fitting_config_t cal_cfg =
+		{
+			.unit_id = PUMP_ADC_UNIT,
+			.atten = ADC_ATTEN_DB_11,
+			.bitwidth = ADC_BITWIDTH_12,
+		};
+
+		if(adc_cali_create_scheme_curve_fitting(&cal_cfg, &s_adc_cali) == ESP_OK)
+		{
+			s_adc_cal_ok = true;
+			ESP_LOGI(TAG, "ADC calibration: curve fitting OK");
+			return;
+		}
+	}
+	#endif
+
+	#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+	{
+		adc_cali_line_fitting_config_t cal_cfg =
+		{
+			.unit_id = PUMP_ADC_UNIT,
+			.atten = ADC_ATTEN_DB_11,
+			.bitwidth = ADC_BITWIDTH_12,
+		};
+
+		if(adc_cali_create_scheme_line_fitting(&cal_cfg, &s_adc_cali) == ESP_OK)
+		{
+			s_adc_cal_ok = true;
+			ESP_LOGI(TAG, "ADC calibration: line fitting OK");
+			return;
+		}
+	}
+	#endif
+
+	ESP_LOGW(TAG, "ADC calibration not available -> using rough raw->mV mapping");
+}
+
+// adc калібрація
+
 /* -------------------------------------------------------------------------- */
 /*  Вимірювання напруги A->B та B->A через новий ADC                          */
 /* -------------------------------------------------------------------------- */
@@ -104,7 +161,10 @@ static water_state_t classify_voltage(float u)
 static float measure_voltage(bool drive_a)
 {
 	const int	samples = 10;
-	int			sum = 0;
+
+	int			sum_raw = 0;
+	int			sum_mv = 0;
+	int			mv_ok_cnt = 0;
 
 	// Обидва електроди спочатку в hi-Z
 	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_INPUT);
@@ -119,6 +179,8 @@ static float measure_voltage(bool drive_a)
 
 	vTaskDelay(pdMS_TO_TICKS(5));	// стабілізація
 
+	bool use_cali = (s_adc_cal_ok && s_adc_cali);
+
 	for (int i = 0; i < samples; ++i) {
 		int raw = 0;
 		esp_err_t err = adc_oneshot_read(s_adc, sense_ch, &raw);
@@ -127,17 +189,50 @@ static float measure_voltage(bool drive_a)
 			gpio_set_direction(drive_gpio, GPIO_MODE_INPUT);
 			return NAN;
 		}
-		sum += raw;
+
+		if (use_cali) {
+			int mv = 0;
+			err = adc_cali_raw_to_voltage(s_adc_cali, raw, &mv);
+			if (err == ESP_OK) {
+				sum_mv += mv;
+				mv_ok_cnt++;
+			} else {
+				// якщо раптом якийсь семпл не конвертнувся — не валимо вимір, просто fallback на raw статистику
+				sum_raw += raw;
+			}
+		} else {
+			sum_raw += raw;
+		}
+
 		vTaskDelay(pdMS_TO_TICKS(2));
 	}
 
 	// Відпускаємо драйвер назад в hi-Z
 	gpio_set_direction(drive_gpio, GPIO_MODE_INPUT);
 
-	float avg_raw  = (float)sum / (float)samples;
-	float voltage  = (avg_raw / ADC_MAX_RAW) * ADC_VREF;
-	return voltage;
+	// ---- РОЗРЯД (анти-хвіст) ----
+	// коротко притискаємо обидва електроди до GND, щоб "скинути" заряд з дротів/електродів
+	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_OUTPUT);
+	gpio_set_direction(s_pump.level_b_gpio, GPIO_MODE_OUTPUT);
+	gpio_set_level(s_pump.level_a_gpio, 0);
+	gpio_set_level(s_pump.level_b_gpio, 0);
+	vTaskDelay(pdMS_TO_TICKS(2));
+
+	// назад в hi-Z
+	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_INPUT);
+	gpio_set_direction(s_pump.level_b_gpio, GPIO_MODE_INPUT);
+
+
+	if (use_cali && mv_ok_cnt > 0) {
+		float avg_mv = (float)sum_mv / (float)mv_ok_cnt;
+		return avg_mv / 1000.0f;
+	}
+
+	// fallback (як було раніше)
+	float avg_raw = (float)sum_raw / (float)samples;
+	return (avg_raw / ADC_MAX_RAW) * ADC_VREF;
 }
+
 
 /**
  * Читаємо обидва напрями й отримуємо:
@@ -311,6 +406,11 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	};
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, LEVEL_A_CHANNEL, &chan_cfg));
 	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, LEVEL_B_CHANNEL, &chan_cfg));
+
+	// adc калібрація
+	adc_try_init_calibration();
+	ESP_LOGI(TAG, "ADC cal=%s", s_adc_cal_ok ? "YES" : "NO");
+	// adc калібрація
 
 	// Початковий стан автополиву
 	uint32_t now = now_ms();
