@@ -42,6 +42,10 @@ static const char *TAG = "pump_node";
 #define LEVEL_A_CHANNEL			ADC_CHANNEL_4	// GPIO32
 #define LEVEL_B_CHANNEL			ADC_CHANNEL_5	// GPIO33
 
+#ifndef ADC_ATTEN_DB_11
+#define ADC_ATTEN_DB_11 ADC_ATTEN_DB_12
+#endif
+
 /* -------------------------------------------------------------------------- */
 /*  Типи / глобальний контекст                                               */
 /* -------------------------------------------------------------------------- */

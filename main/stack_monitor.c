@@ -6,11 +6,25 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #define STACK_MONITOR_MAX_TASKS	25
 #define STACK_MONITOR_PERIOD_MS	60000	// раз на 60 секунд
 
 static const char *TAG = "[STACKMON]";
+
+static void log_ram_snapshot(void)
+{
+	size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+	size_t min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+	size_t total_bytes = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+
+	ESP_LOGI(TAG,
+			"RAM: free=%u min=%u total=%u bytes",
+			(unsigned)free_bytes,
+			(unsigned)min_free_bytes,
+			(unsigned)total_bytes);
+}
 
 // Основна таска моніторингу
 static void stack_monitor_task(void *arg)
@@ -125,6 +139,7 @@ static void stack_monitor_task(void *arg)
 					cpu_load, dt_total, dt_idle);
 		}
 
+		log_ram_snapshot();
 		ESP_LOGI(TAG, "===== END STACK MONITOR =====");
 
 		vTaskDelay(pdMS_TO_TICKS(STACK_MONITOR_PERIOD_MS));
