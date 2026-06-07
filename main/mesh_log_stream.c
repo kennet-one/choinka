@@ -9,6 +9,7 @@
 
 #include "esp_log.h"
 #include "esp_mesh.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -60,7 +61,7 @@ static void build_time_prefix(char *out, size_t out_sz)
 
 static void send_nodeinfo_to_root(void)
 {
-	mesh_nodeinfo_packet_t p;
+	mesh_nodeinfo_v2_packet_t p;
 	memset(&p, 0, sizeof(p));
 
 	p.h.magic = MESH_PKT_MAGIC;
@@ -70,6 +71,7 @@ static void send_nodeinfo_to_root(void)
 
 	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
 	strncpy(p.tag, s_tag, sizeof(p.tag) - 1);
+	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 
 	mesh_data_t data;
 	memset(&data, 0, sizeof(data));

@@ -5,8 +5,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_flash.h"
+#include "esp_image_format.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "nvs.h"
 
 #define STACK_MONITOR_MAX_TASKS	25
 #define STACK_MONITOR_PERIOD_MS	60000	// раз на 60 секунд
@@ -24,6 +28,51 @@ static void log_ram_snapshot(void)
 			(unsigned)free_bytes,
 			(unsigned)min_free_bytes,
 			(unsigned)total_bytes);
+}
+
+static void log_flash_snapshot(void)
+{
+	uint32_t flash_size = 0;
+	uint32_t app_used = 0;
+	uint32_t app_slot = 0;
+	uint32_t nvs_used = 0;
+	uint32_t nvs_free = 0;
+	uint32_t nvs_avail = 0;
+	uint32_t nvs_total = 0;
+
+	esp_flash_get_size(NULL, &flash_size);
+
+	const esp_partition_t *app_partition = esp_ota_get_running_partition();
+	if (app_partition) {
+		app_slot = (uint32_t)app_partition->size;
+
+		esp_partition_pos_t app_pos = {
+			.offset = app_partition->address,
+			.size = app_partition->size,
+		};
+		esp_image_metadata_t app_meta = {0};
+		if (esp_image_get_metadata(&app_pos, &app_meta) == ESP_OK) {
+			app_used = (uint32_t)app_meta.image_len;
+		}
+	}
+
+	nvs_stats_t nvs_stats = {0};
+	if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
+		nvs_used = (uint32_t)nvs_stats.used_entries;
+		nvs_free = (uint32_t)nvs_stats.free_entries;
+		nvs_avail = (uint32_t)nvs_stats.available_entries;
+		nvs_total = (uint32_t)nvs_stats.total_entries;
+	}
+
+	ESP_LOGI(TAG,
+			"FLASH: chip=%u app_used=%u app_slot=%u nvs_used=%u nvs_free=%u nvs_avail=%u nvs_total=%u",
+			(unsigned)flash_size,
+			(unsigned)app_used,
+			(unsigned)app_slot,
+			(unsigned)nvs_used,
+			(unsigned)nvs_free,
+			(unsigned)nvs_avail,
+			(unsigned)nvs_total);
 }
 
 // Основна таска моніторингу
@@ -46,8 +95,9 @@ static void stack_monitor_task(void *arg)
 				STACK_MONITOR_MAX_TASKS,
 				&total_time);
 
-		ESP_LOGI(TAG, "===== STACK MONITOR: %u task(s) =====",
-				(unsigned)count);
+		ESP_LOGI(TAG, "===== STACK MONITOR: %u task(s), slots=%u =====",
+				(unsigned)count,
+				(unsigned)STACK_MONITOR_MAX_TASKS);
 
 		if (!have_prev) {
 			// Перший прохід – ще нема попереднього снапшота,
@@ -140,6 +190,7 @@ static void stack_monitor_task(void *arg)
 		}
 
 		log_ram_snapshot();
+		log_flash_snapshot();
 		ESP_LOGI(TAG, "===== END STACK MONITOR =====");
 
 		vTaskDelay(pdMS_TO_TICKS(STACK_MONITOR_PERIOD_MS));
