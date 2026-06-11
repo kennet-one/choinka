@@ -71,6 +71,7 @@ static void send_nodeinfo_to_root(void)
 
 	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
 	strncpy(p.tag, s_tag, sizeof(p.tag) - 1);
+	p.tag[sizeof(p.tag) - 1] = '\0';
 	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 
 	mesh_data_t data;
@@ -101,9 +102,11 @@ static void send_logline_to_root(const char *line)
 
 	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
 	strncpy(p.tag, s_tag, sizeof(p.tag) - 1);
+	p.tag[sizeof(p.tag) - 1] = '\0';
 
 	// line already includes time prefix we build here
 	strncpy(p.line, line, sizeof(p.line) - 1);
+	p.line[sizeof(p.line) - 1] = '\0';
 
 	mesh_data_t data;
 	memset(&data, 0, sizeof(data));

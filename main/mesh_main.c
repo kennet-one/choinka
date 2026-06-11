@@ -12,6 +12,7 @@
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 
 #include "legacy_proto.h"
@@ -65,6 +66,23 @@ static void mesh_event_handler(void *arg,
 
 static void mesh_rx_task(void *arg);
 static esp_err_t mesh_comm_start(void);
+
+static void ota_mark_running_app_valid_if_pending(void)
+{
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+
+	if (!running) return;
+	if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+	if (state != ESP_OTA_IMG_PENDING_VERIFY) return;
+
+	esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+	if (err == ESP_OK) {
+		ESP_LOGI(MESH_TAG, "OTA rollback: running app marked valid");
+	} else {
+		ESP_LOGE(MESH_TAG, "OTA rollback: mark valid failed: %s", esp_err_to_name(err));
+	}
+}
 
 /* -------------------------------------------------------------------------- */
 /*  RX task – слухаємо пакети від інших нод                                   */
@@ -335,6 +353,7 @@ static void mesh_event_handler(void *arg,
 void app_main(void)
 {
 	ESP_ERROR_CHECK(nvs_flash_init());
+	ota_mark_running_app_valid_if_pending();
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
