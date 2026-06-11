@@ -5,5 +5,6 @@ idf_component_register(SRCS "mesh_main.c"
                         "mesh_time_sync.c"
                         "log_time_vprintf.c"
                         "mesh_log_stream.c"
+                        "mesh_ota_receiver.c"
                     PRIV_REQUIRES esp_wifi esp_driver_gpio esp_adc driver nvs_flash heap esp_timer app_update spi_flash bootloader_support
                     INCLUDE_DIRS "." "include")

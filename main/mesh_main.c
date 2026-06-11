@@ -22,6 +22,7 @@
 #include "mesh_proto.h"
 #include "mesh_time_sync.h"
 #include "mesh_log_stream.h"
+#include "mesh_ota_receiver.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -131,6 +132,14 @@ static void mesh_rx_task(void *arg)
 
 		if (h->type == MESH_LOG_TYPE_CTRL) {
 			mesh_log_stream_handle_rx(rx_buf, data.size);
+			continue;
+		}
+
+		if (h->type == MESH_OTA_TYPE_BEGIN ||
+		    h->type == MESH_OTA_TYPE_DATA ||
+		    h->type == MESH_OTA_TYPE_END ||
+		    h->type == MESH_OTA_TYPE_ABORT) {
+			mesh_ota_receiver_handle_rx(rx_buf, data.size);
 			continue;
 		}
 
