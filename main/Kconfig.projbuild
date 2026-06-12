@@ -99,6 +99,21 @@ menu "Example Configuration"
         help
             Max layer allowed in mesh network.
 
+    config CHOINKA_DIRECT_ROOT_ONLY
+        bool "Emergency: force choinka to attach only near root"
+        default n
+        help
+            Limits choinka to layer 2 as a temporary recovery/stabilization
+            mode. Keep disabled for V2 tunnel and chained mesh testing.
+
+    config CHOINKA_DIRECT_MAX_LAYER
+        int "Emergency direct-root max layer"
+        depends on CHOINKA_DIRECT_ROOT_ONLY
+        range 2 25
+        default 2
+        help
+            Max layer used when CHOINKA_DIRECT_ROOT_ONLY is enabled.
+
     config MESH_CHANNEL
         int "channel"
         range 0 14

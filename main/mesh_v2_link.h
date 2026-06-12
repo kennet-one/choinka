@@ -14,10 +14,17 @@ void mesh_v2_node_init(const char *tag);
 void mesh_v2_node_on_mesh_connected(void);
 void mesh_v2_node_on_mesh_disconnected(void);
 esp_err_t mesh_v2_node_handle_rx(const void *pkt_buf, size_t pkt_len);
+void mesh_v2_node_update_topology(const uint8_t parent_mac[6],
+                                  const uint8_t root_mac[6],
+                                  uint16_t layer,
+                                  uint16_t max_layer,
+                                  int8_t parent_rssi,
+                                  uint8_t child_count);
 
 bool mesh_v2_node_ready(void);
 esp_err_t mesh_v2_node_send_nodeinfo(void);
 esp_err_t mesh_v2_node_send_log_line(const char *line);
+esp_err_t mesh_v2_node_send_topology(void);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,8 +35,14 @@
 #define MESH_RECONNECT_CHECK_MS 5000U
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
-#define CHOINKA_DIRECT_ROOT_ONLY 1U
-#define CHOINKA_DIRECT_MAX_LAYER 2U
+
+#ifndef CONFIG_CHOINKA_DIRECT_ROOT_ONLY
+#define CONFIG_CHOINKA_DIRECT_ROOT_ONLY 0
+#endif
+
+#ifndef CONFIG_CHOINKA_DIRECT_MAX_LAYER
+#define CONFIG_CHOINKA_DIRECT_MAX_LAYER 2
+#endif
 
 static const char *MESH_TAG = "choinka";
 
@@ -45,7 +52,10 @@ static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77 };
 static bool       is_running        = true;
 static volatile bool is_mesh_connected = false;
 static mesh_addr_t mesh_parent_addr;
+static uint8_t mesh_root_addr[6] = {0};
 static int        mesh_layer        = -1;
+static uint8_t    mesh_max_layer    = 0;
+static uint8_t    mesh_child_count  = 0;
 static esp_netif_t *netif_sta       = NULL;
 static uint32_t   s_disconnected_since_ms = 0;
 static uint32_t   s_last_reconnect_attempt_ms = 0;
@@ -82,6 +92,28 @@ static esp_err_t mesh_comm_start(void);
 static uint32_t tick_ms(void)
 {
 	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static int8_t current_parent_rssi(void)
+{
+	wifi_ap_record_t ap;
+	if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+		return ap.rssi;
+	}
+	return -127;
+}
+
+static void update_v2_topology(bool send_now)
+{
+	mesh_v2_node_update_topology(mesh_parent_addr.addr,
+	                             mesh_root_addr,
+	                             (mesh_layer > 0) ? (uint16_t)mesh_layer : 0,
+	                             mesh_max_layer,
+	                             current_parent_rssi(),
+	                             mesh_child_count);
+	if (send_now && is_mesh_connected) {
+		(void)mesh_v2_node_send_topology();
+	}
 }
 
 static void note_mesh_disconnected(void)
@@ -338,18 +370,26 @@ static void mesh_event_handler(void *arg,
 	case MESH_EVENT_CHILD_CONNECTED: {
 		mesh_event_child_connected_t *child =
 		    (mesh_event_child_connected_t *)event_data;
+		if (mesh_child_count < UINT8_MAX) {
+			mesh_child_count++;
+		}
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_CHILD_CONNECTED> aid:%d, " MACSTR,
 		         child->aid, MAC2STR(child->mac));
+		update_v2_topology(true);
 	}
 	break;
 
 	case MESH_EVENT_CHILD_DISCONNECTED: {
 		mesh_event_child_disconnected_t *child =
 		    (mesh_event_child_disconnected_t *)event_data;
+		if (mesh_child_count > 0) {
+			mesh_child_count--;
+		}
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_CHILD_DISCONNECTED> aid:%d, " MACSTR,
 		         child->aid, MAC2STR(child->mac));
+		update_v2_topology(true);
 	}
 	break;
 
@@ -387,6 +427,7 @@ static void mesh_event_handler(void *arg,
 		mesh_layer = conn->self_layer;
 		memcpy(mesh_parent_addr.addr, conn->connected.bssid, 6);
 		note_mesh_connected();
+		update_v2_topology(false);
 
 		mesh_v2_node_on_mesh_connected();
 		mesh_log_stream_on_mesh_connected();
@@ -420,6 +461,7 @@ static void mesh_event_handler(void *arg,
 		mesh_layer = esp_mesh_get_layer();
 		mesh_v2_node_on_mesh_disconnected();
 		mesh_log_stream_on_mesh_disconnected();
+		update_v2_topology(false);
 	}
 	break;
 
@@ -433,15 +475,18 @@ static void mesh_event_handler(void *arg,
 		         esp_mesh_is_root() ? "<ROOT>" :
 		         (mesh_layer == 2) ? "<layer2>" : "");
 		last_layer = mesh_layer;
+		update_v2_topology(true);
 	}
 	break;
 
 	case MESH_EVENT_ROOT_ADDRESS: {
 		mesh_event_root_address_t *ra =
 		    (mesh_event_root_address_t *)event_data;
+		memcpy(mesh_root_addr, ra->addr, sizeof(mesh_root_addr));
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_ROOT_ADDRESS> root:" MACSTR,
 		         MAC2STR(ra->addr));
+		update_v2_topology(true);
 	}
 	break;
 
@@ -506,18 +551,18 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_mesh_fix_root(true));
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
-	uint8_t max_layer = CONFIG_MESH_MAX_LAYER;
-#if CHOINKA_DIRECT_ROOT_ONLY
-	if (max_layer > CHOINKA_DIRECT_MAX_LAYER) {
-		max_layer = CHOINKA_DIRECT_MAX_LAYER;
+	mesh_max_layer = CONFIG_MESH_MAX_LAYER;
+#if CONFIG_CHOINKA_DIRECT_ROOT_ONLY
+	if (mesh_max_layer > CONFIG_CHOINKA_DIRECT_MAX_LAYER) {
+		mesh_max_layer = CONFIG_CHOINKA_DIRECT_MAX_LAYER;
 	}
 #endif
-	ESP_ERROR_CHECK(esp_mesh_set_max_layer(max_layer));
+	ESP_ERROR_CHECK(esp_mesh_set_max_layer(mesh_max_layer));
 	ESP_LOGI(MESH_TAG,
 	         "mesh max layer:%u (configured:%u, direct_root_only:%u)",
-	         (unsigned)max_layer,
+	         (unsigned)mesh_max_layer,
 	         (unsigned)CONFIG_MESH_MAX_LAYER,
-	         (unsigned)CHOINKA_DIRECT_ROOT_ONLY);
+	         (unsigned)CONFIG_CHOINKA_DIRECT_ROOT_ONLY);
 	ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
 	ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
 

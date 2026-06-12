@@ -107,6 +107,10 @@ static void send_logline_to_root(const char *line)
 	if (!line) return;
 	if (!s_mesh_connected) return;
 
+	if (mesh_v2_node_send_log_line(line) == ESP_OK) {
+		return;
+	}
+
 	mesh_log_line_packet_t p;
 	memset(&p, 0, sizeof(p));
 
@@ -156,6 +160,7 @@ static void nodeinfo_heartbeat_task(void *arg)
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(LOG_STREAM_NODEINFO_PERIOD_MS));
 		send_nodeinfo_to_root();
+		(void)mesh_v2_node_send_topology();
 	}
 }
 
