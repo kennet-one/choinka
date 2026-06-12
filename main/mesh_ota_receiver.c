@@ -20,6 +20,8 @@
 
 static const char *TAG = "mesh_ota";
 
+#define MESH_OTA_RX_TIMEOUT_MS		60000U
+
 typedef struct {
 	bool active;
 	esp_ota_handle_t handle;
@@ -27,10 +29,14 @@ typedef struct {
 	uint32_t image_size;
 	uint32_t written;
 	uint16_t last_seq;
+	TickType_t last_rx_tick;
 } mesh_ota_rx_state_t;
 
 static mesh_ota_rx_state_t s_ota = {0};
 static uint32_t s_status_counter = 0;
+static bool s_reboot_pending = false;
+static uint16_t s_reboot_end_seq = 0;
+static uint32_t s_reboot_total = 0;
 
 static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz)
 {
@@ -56,6 +62,21 @@ static bool packet_text_equals(const char *field, size_t field_sz, const char *e
 
 	copy_packet_text(clean, sizeof(clean), field, field_sz);
 	return expected && strcmp(clean, expected) == 0;
+}
+
+static bool ota_rx_stale(void)
+{
+	if (!s_ota.active) {
+		return false;
+	}
+
+	return (xTaskGetTickCount() - s_ota.last_rx_tick) >
+	       pdMS_TO_TICKS(MESH_OTA_RX_TIMEOUT_MS);
+}
+
+static void ota_rx_touch(void)
+{
+	s_ota.last_rx_tick = xTaskGetTickCount();
 }
 
 static void send_status(uint8_t op, uint8_t code, uint16_t seq,
@@ -101,6 +122,17 @@ static void finish_abort(void)
 	memset(&s_ota, 0, sizeof(s_ota));
 }
 
+static void finish_stale_abort(void)
+{
+	if (!ota_rx_stale()) {
+		return;
+	}
+
+	ESP_LOGW(TAG, "remote OTA timed out after %u ms, aborting partial image",
+	         (unsigned)MESH_OTA_RX_TIMEOUT_MS);
+	finish_abort();
+}
+
 static void reboot_task(void *arg)
 {
 	(void)arg;
@@ -112,7 +144,22 @@ static esp_err_t handle_begin(const mesh_ota_begin_packet_t *p, size_t pkt_len)
 {
 	(void)pkt_len;
 
+	if (s_reboot_pending) {
+		send_status(MESH_OTA_OP_BEGIN, MESH_OTA_STATUS_BUSY, p->seq,
+		            s_reboot_total, s_reboot_total, "OTA reboot pending");
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	finish_stale_abort();
+
 	if (s_ota.active) {
+		if (p->seq == s_ota.last_seq && s_ota.written == 0 &&
+		    p->image_size == s_ota.image_size && s_ota.partition) {
+			ota_rx_touch();
+			send_status(MESH_OTA_OP_BEGIN, MESH_OTA_STATUS_OK, p->seq,
+			            0, s_ota.image_size, s_ota.partition->label);
+			return ESP_OK;
+		}
 		send_status(MESH_OTA_OP_BEGIN, MESH_OTA_STATUS_BUSY, p->seq,
 		            s_ota.written, s_ota.image_size, "OTA already active");
 		return ESP_ERR_INVALID_STATE;
@@ -163,6 +210,8 @@ static esp_err_t handle_begin(const mesh_ota_begin_packet_t *p, size_t pkt_len)
 	s_ota.partition = partition;
 	s_ota.image_size = p->image_size;
 	s_ota.last_seq = p->seq;
+	ota_rx_touch();
+	s_reboot_pending = false;
 
 	char version[MESH_OTA_VERSION_MAX + 1];
 	copy_packet_text(version, sizeof(version), p->version, sizeof(p->version));
@@ -178,6 +227,8 @@ static esp_err_t handle_data(const mesh_ota_data_packet_t *p, size_t pkt_len)
 {
 	const size_t header_len = offsetof(mesh_ota_data_packet_t, data);
 
+	finish_stale_abort();
+
 	if (!s_ota.active) {
 		send_status(MESH_OTA_OP_DATA, MESH_OTA_STATUS_ERROR, p->seq, 0, 0, "OTA not active");
 		return ESP_ERR_INVALID_STATE;
@@ -190,6 +241,14 @@ static esp_err_t handle_data(const mesh_ota_data_packet_t *p, size_t pkt_len)
 	}
 
 	if (p->offset != s_ota.written || p->offset + p->len > s_ota.image_size) {
+		if (p->seq == s_ota.last_seq &&
+		    p->offset < s_ota.written &&
+		    p->offset + p->len == s_ota.written) {
+			ota_rx_touch();
+			send_status(MESH_OTA_OP_DATA, MESH_OTA_STATUS_OK, p->seq,
+			            s_ota.written, s_ota.image_size, "duplicate chunk OK");
+			return ESP_OK;
+		}
 		send_status(MESH_OTA_OP_DATA, MESH_OTA_STATUS_ERROR, p->seq,
 		            s_ota.written, s_ota.image_size, "offset mismatch");
 		return ESP_ERR_INVALID_ARG;
@@ -207,6 +266,7 @@ static esp_err_t handle_data(const mesh_ota_data_packet_t *p, size_t pkt_len)
 
 	s_ota.written += p->len;
 	s_ota.last_seq = p->seq;
+	ota_rx_touch();
 	send_status(MESH_OTA_OP_DATA, MESH_OTA_STATUS_OK, p->seq,
 	            s_ota.written, s_ota.image_size, "chunk OK");
 	return ESP_OK;
@@ -215,6 +275,16 @@ static esp_err_t handle_data(const mesh_ota_data_packet_t *p, size_t pkt_len)
 static esp_err_t handle_end(const mesh_ota_end_packet_t *p, size_t pkt_len)
 {
 	(void)pkt_len;
+
+	if (s_reboot_pending &&
+	    p->seq == s_reboot_end_seq &&
+	    p->image_size == s_reboot_total) {
+		send_status(MESH_OTA_OP_END, MESH_OTA_STATUS_OK, p->seq,
+		            s_reboot_total, s_reboot_total, "OTA OK rebooting");
+		return ESP_OK;
+	}
+
+	finish_stale_abort();
 
 	if (!s_ota.active) {
 		send_status(MESH_OTA_OP_END, MESH_OTA_STATUS_ERROR, p->seq, 0, 0, "OTA not active");
@@ -252,12 +322,18 @@ static esp_err_t handle_end(const mesh_ota_end_packet_t *p, size_t pkt_len)
 	ESP_LOGI(TAG, "remote OTA complete: boot=%s size=%lu",
 	         label, (unsigned long)s_ota.image_size);
 
+	s_reboot_pending = true;
+	s_reboot_end_seq = p->seq;
+	s_reboot_total = s_ota.image_size;
+
 	send_status(MESH_OTA_OP_END, MESH_OTA_STATUS_OK, p->seq,
 	            s_ota.written, s_ota.image_size, "OTA OK rebooting");
 	memset(&s_ota, 0, sizeof(s_ota));
 
 	if (xTaskCreate(reboot_task, "ota_reboot", 2048, NULL, 5, NULL) != pdPASS) {
 		ESP_LOGW(TAG, "failed to create OTA reboot task");
+		vTaskDelay(pdMS_TO_TICKS(1500));
+		esp_restart();
 	}
 	return ESP_OK;
 }
@@ -265,6 +341,12 @@ static esp_err_t handle_end(const mesh_ota_end_packet_t *p, size_t pkt_len)
 static esp_err_t handle_abort(const mesh_ota_abort_packet_t *p, size_t pkt_len)
 {
 	(void)pkt_len;
+
+	if (s_reboot_pending) {
+		send_status(MESH_OTA_OP_ABORT, MESH_OTA_STATUS_BUSY, p->seq,
+		            s_reboot_total, s_reboot_total, "OTA reboot pending");
+		return ESP_ERR_INVALID_STATE;
+	}
 
 	finish_abort();
 	send_status(MESH_OTA_OP_ABORT, MESH_OTA_STATUS_OK, p->seq, 0, 0, "OTA aborted");

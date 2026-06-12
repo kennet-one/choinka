@@ -121,6 +121,19 @@ static void send_logline_to_root(const char *line)
 	esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 
+static void send_stream_status_to_root(bool enabled)
+{
+	char tprefix[40];
+	char line[96];
+
+	build_time_prefix(tprefix, sizeof(tprefix));
+	snprintf(line, sizeof(line),
+	         "%sI (0) mesh_log: remote log stream %s",
+	         tprefix,
+	         enabled ? "ready" : "disabled");
+	send_logline_to_root(line);
+}
+
 static int mesh_log_vprintf(const char *fmt, va_list ap)
 {
 	// 1) друк на UART через попередній sink
@@ -232,7 +245,13 @@ esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
 		return ESP_ERR_INVALID_ARG;
 	}
 
-	s_stream_enabled = (p->enable != 0);
+	bool enable = (p->enable != 0);
+	s_stream_enabled = enable;
+
+	if (enable) {
+		send_nodeinfo_to_root();
+		send_stream_status_to_root(true);
+	}
 
 	// НЕ логуй тут — це приходить через vprintf і може бути рекурсія
 	return ESP_OK;
