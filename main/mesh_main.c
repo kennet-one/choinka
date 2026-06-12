@@ -23,6 +23,7 @@
 #include "mesh_time_sync.h"
 #include "mesh_log_stream.h"
 #include "mesh_ota_receiver.h"
+#include "mesh_v2_link.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Константи / глобальні змінні                                              */
@@ -117,6 +118,11 @@ static void mesh_rx_task(void *arg)
 		}
 
 		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
+
+		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION_V2) {
+			mesh_v2_node_handle_rx(rx_buf, data.size);
+			continue;
+		}
 
 		// не наш протокол? ігноруємо
 		if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION) {
@@ -274,6 +280,7 @@ static void mesh_event_handler(void *arg,
 		mesh_layer = conn->self_layer;
 		memcpy(mesh_parent_addr.addr, conn->connected.bssid, 6);
 
+		mesh_v2_node_on_mesh_connected();
 		mesh_log_stream_on_mesh_connected();
 
 		ESP_LOGI(MESH_TAG,
@@ -439,5 +446,6 @@ void app_main(void)
 	pump_node_start_task(5);     
 	mesh_time_sync_init();
 	log_time_vprintf_start();     
+	mesh_v2_node_init(MESH_TAG);
 	mesh_log_stream_init(MESH_TAG);
 }

@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 
 #include "mesh_proto.h"
+#include "mesh_v2_link.h"
 
 static const char *TAG = "mesh_log";
 
@@ -61,6 +62,10 @@ static void build_time_prefix(char *out, size_t out_sz)
 
 static void send_nodeinfo_to_root(void)
 {
+	if (mesh_v2_node_ready() && mesh_v2_node_send_nodeinfo() == ESP_OK) {
+		return;
+	}
+
 	mesh_nodeinfo_v2_packet_t p;
 	memset(&p, 0, sizeof(p));
 
@@ -91,6 +96,10 @@ static void send_nodeinfo_to_root(void)
 static void send_logline_to_root(const char *line)
 {
 	if (!line) return;
+
+	if (mesh_v2_node_ready() && mesh_v2_node_send_log_line(line) == ESP_OK) {
+		return;
+	}
 
 	mesh_log_line_packet_t p;
 	memset(&p, 0, sizeof(p));
