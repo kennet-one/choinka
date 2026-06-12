@@ -6,13 +6,14 @@
 extern "C" {
 #endif
 
-// Викликати 1 раз на старті (після log_time_vprintf_start())
+// Call once during startup, after log_time_vprintf_start().
 void mesh_log_stream_init(const char *tag);
 
-// Викликати коли нода реально підключилась до mesh (PARENT_CONNECTED)
+// Call when the node is actually connected to mesh (PARENT_CONNECTED).
 void mesh_log_stream_on_mesh_connected(void);
+void mesh_log_stream_on_mesh_disconnected(void);
 
-// Викликати з mesh_rx_task() коли прийшов пакет типу MESH_LOG_TYPE_CTRL
+// Call from mesh_rx_task() when MESH_LOG_TYPE_CTRL is received.
 esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len);
 
 #ifdef __cplusplus

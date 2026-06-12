@@ -26,6 +26,7 @@ static vprintf_like_t	s_prev_vprintf = NULL;
 
 static bool		s_inited = false;
 static bool		s_stream_enabled = false;
+static bool		s_mesh_connected = false;
 static bool		s_in_hook = false;
 
 static char		s_tag[16] = "node";
@@ -67,9 +68,11 @@ static void build_time_prefix(char *out, size_t out_sz)
 
 static void send_nodeinfo_to_root(void)
 {
-	if (mesh_v2_node_ready() && mesh_v2_node_send_nodeinfo() == ESP_OK) {
+	if (!s_mesh_connected) {
 		return;
 	}
+
+	(void)mesh_v2_node_send_nodeinfo();
 
 	mesh_nodeinfo_v2_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -94,13 +97,15 @@ static void send_nodeinfo_to_root(void)
 	mesh_addr_t dest;
 	memset(&dest, 0, sizeof(dest)); // root
 
-	// НІЯКИХ ESP_LOG тут (щоб не рекурсія)
-	esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	// Keep V1 NODEINFO alive as a compatibility beacon. It makes the node
+	// visible even while V2 is recovering after a root reboot.
+	(void)esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 
 static void send_logline_to_root(const char *line)
 {
 	if (!line) return;
+	if (!s_mesh_connected) return;
 
 	mesh_log_line_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -156,7 +161,7 @@ static void nodeinfo_heartbeat_task(void *arg)
 
 static int mesh_log_vprintf(const char *fmt, va_list ap)
 {
-	// 1) друк на UART через попередній sink
+	// 1) Print to UART through the previous sink.
 	int ret = 0;
 	if (s_prev_vprintf) {
 		va_list ap_copy;
@@ -165,10 +170,10 @@ static int mesh_log_vprintf(const char *fmt, va_list ap)
 		va_end(ap_copy);
 	}
 
-	// 2) якщо стрім вимкнений — все
+	// 2) Stop here when remote streaming is disabled.
 	if (!s_stream_enabled) return ret;
 
-	// 3) анти-рекурсія
+	// 3) Recursion guard.
 	if (s_in_hook) return ret;
 	s_in_hook = true;
 
@@ -202,7 +207,7 @@ static int mesh_log_vprintf(const char *fmt, va_list ap)
 		return ret;
 	}
 
-	// heap fallback (обрізаний)
+	// Truncated heap fallback.
 	size_t need = copy_t + (size_t)w + 1;
 	if (need > LOG_STREAM_HEAP_MAX) need = LOG_STREAM_HEAP_MAX;
 
@@ -249,8 +254,14 @@ void mesh_log_stream_init(const char *tag)
 
 void mesh_log_stream_on_mesh_connected(void)
 {
-	// Можна кілька разів — не критично
+	s_mesh_connected = true;
 	send_nodeinfo_to_root();
+}
+
+void mesh_log_stream_on_mesh_disconnected(void)
+{
+	s_mesh_connected = false;
+	s_stream_enabled = false;
 }
 
 esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
@@ -276,6 +287,6 @@ esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
 		send_stream_status_to_root(true);
 	}
 
-	// НЕ логуй тут — це приходить через vprintf і може бути рекурсія
+	// Do not log here: this path is reached from the vprintf hook.
 	return ESP_OK;
 }

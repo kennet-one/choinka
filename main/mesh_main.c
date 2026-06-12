@@ -26,39 +26,48 @@
 #include "mesh_v2_link.h"
 
 /* -------------------------------------------------------------------------- */
-/*  Константи / глобальні змінні                                              */
+/*  Constants / globals                                                       */
 /* -------------------------------------------------------------------------- */
 
 #define RX_SIZE          (256)
 #define TX_INTERVAL_MS   (5000)
+#define MESH_RECONNECT_CHECK_MS 5000U
+#define MESH_RECONNECT_SOFT_MS  20000U
+#define MESH_RECONNECT_HARD_MS  60000U
+#define CHOINKA_DIRECT_ROOT_ONLY 1U
+#define CHOINKA_DIRECT_MAX_LAYER 2U
 
 static const char *MESH_TAG = "choinka";
 
-/* Один і той самий MESH_ID на всі ноди в цій мережі */
+/* Same MESH_ID on every node in this mesh network. */
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77 };
 
 static bool       is_running        = true;
-static bool       is_mesh_connected = false;
+static volatile bool is_mesh_connected = false;
 static mesh_addr_t mesh_parent_addr;
 static int        mesh_layer        = -1;
 static esp_netif_t *netif_sta       = NULL;
+static uint32_t   s_disconnected_since_ms = 0;
+static uint32_t   s_last_reconnect_attempt_ms = 0;
+static uint32_t   s_last_mesh_restart_ms = 0;
+static TaskHandle_t s_mesh_reconnect_task = NULL;
 
 /* -------------------------------------------------------------------------- */
-/*  Мінімальний власний протокол                                              */
+/*  Minimal local protocol                                                    */
 /* -------------------------------------------------------------------------- */
 /*
- * Формат нашого пакету:
- *  magic    - 0xA5 (для перевірки, що це "наш" пакет)
- *  version  - версія протоколу (1)
- *  type     - тип (1 = просто текстове "Hello N")
- *  reserved - вирівнювання, запас
- *  counter  - лічильник пакета від цієї ноди
- *  src_mac  - MAC відправника
- *  payload  - невеликий текст (рядок з '\0' в кінці)
+ * Packet format:
+ *  magic    - 0xA5, identifies our packet
+ *  version  - protocol version
+ *  type     - packet type
+ *  reserved - alignment / future use
+ *  counter  - per-node packet counter
+ *  src_mac  - sender MAC
+ *  payload  - small zero-terminated text payload
  */
 
 /* -------------------------------------------------------------------------- */
-/*  Прототипи                                                                 */
+/*  Prototypes                                                                */
 /* -------------------------------------------------------------------------- */
 
 static void mesh_event_handler(void *arg,
@@ -67,7 +76,28 @@ static void mesh_event_handler(void *arg,
                                void *event_data);
 
 static void mesh_rx_task(void *arg);
+static void mesh_reconnect_watchdog_task(void *arg);
 static esp_err_t mesh_comm_start(void);
+
+static uint32_t tick_ms(void)
+{
+	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static void note_mesh_disconnected(void)
+{
+	if (is_mesh_connected || s_disconnected_since_ms == 0) {
+		s_disconnected_since_ms = tick_ms();
+	}
+	is_mesh_connected = false;
+}
+
+static void note_mesh_connected(void)
+{
+	is_mesh_connected = true;
+	s_disconnected_since_ms = 0;
+	s_last_reconnect_attempt_ms = 0;
+}
 
 static void ota_mark_running_app_valid_if_pending(void)
 {
@@ -87,7 +117,7 @@ static void ota_mark_running_app_valid_if_pending(void)
 }
 
 /* -------------------------------------------------------------------------- */
-/*  RX task – слухаємо пакети від інших нод                                   */
+/*  RX task: receive packets from other nodes                                  */
 /* -------------------------------------------------------------------------- */
 
 static void mesh_rx_task(void *arg)
@@ -124,13 +154,13 @@ static void mesh_rx_task(void *arg)
 			continue;
 		}
 
-		// не наш протокол? ігноруємо
+		// Not our protocol; ignore it.
 		if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION) {
 			ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " (%d bytes)", MAC2STR(from.addr), (int)data.size);
 			continue;
 		}
 
-		// диспетчер типів
+		// Packet type dispatcher.
 		if (h->type == MESH_TIME_SYNC_TYPE_TIME) {
 			mesh_time_sync_handle_rx(rx_buf, data.size);
 			continue;
@@ -157,7 +187,7 @@ static void mesh_rx_task(void *arg)
 
 			const mesh_packet_t *p = (const mesh_packet_t *)rx_buf;
 
-			// гарантуємо '\0'
+			// Guarantee trailing NUL.
 			char payload[sizeof(p->payload)];
 			memcpy(payload, p->payload, sizeof(payload));
 			payload[sizeof(payload) - 1] = '\0';
@@ -168,7 +198,7 @@ static void mesh_rx_task(void *arg)
 				payload
 			);
 
-			// <-- ОЦЕ МІСЦЕ: якщо в тебе не legacy_handle_text(), заміни на свій handler
+			// Replace this call if the legacy text handler changes.
 			legacy_handle_text(payload);
 
 			continue;
@@ -183,7 +213,7 @@ static void mesh_rx_task(void *arg)
 
 
 /* -------------------------------------------------------------------------- */
-/*  Запуск задач TX/RX один раз                                               */
+/*  Start TX/RX tasks once                                                     */
 /* -------------------------------------------------------------------------- */
 
 static esp_err_t mesh_comm_start(void)
@@ -196,6 +226,81 @@ static esp_err_t mesh_comm_start(void)
         stack_monitor_start(3);
 	}
 	return ESP_OK;
+}
+
+static void mesh_reconnect_watchdog_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(MESH_RECONNECT_CHECK_MS));
+
+		if (is_mesh_connected) {
+			continue;
+		}
+
+		uint32_t now = tick_ms();
+		if (s_disconnected_since_ms == 0) {
+			s_disconnected_since_ms = now;
+			continue;
+		}
+
+		uint32_t down_ms = (uint32_t)(now - s_disconnected_since_ms);
+		if (down_ms >= MESH_RECONNECT_SOFT_MS &&
+		    (uint32_t)(now - s_last_reconnect_attempt_ms) >= MESH_RECONNECT_SOFT_MS) {
+			s_last_reconnect_attempt_ms = now;
+			ESP_LOGW(MESH_TAG,
+			         "mesh reconnect watchdog: no parent for %lu ms, calling esp_mesh_connect()",
+			         (unsigned long)down_ms);
+			esp_err_t flush_err = esp_mesh_flush_scan_result();
+			if (flush_err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "mesh reconnect watchdog: scan flush failed: %s",
+				         esp_err_to_name(flush_err));
+			}
+			esp_err_t err = esp_mesh_connect();
+			if (err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "mesh reconnect watchdog: esp_mesh_connect failed: %s",
+				         esp_err_to_name(err));
+			}
+		}
+
+		if (down_ms >= MESH_RECONNECT_HARD_MS &&
+		    (uint32_t)(now - s_last_mesh_restart_ms) >= MESH_RECONNECT_HARD_MS) {
+			s_last_mesh_restart_ms = now;
+			s_last_reconnect_attempt_ms = now;
+			ESP_LOGW(MESH_TAG,
+			         "mesh reconnect watchdog: no parent for %lu ms, restarting mesh service",
+			         (unsigned long)down_ms);
+
+			mesh_v2_node_on_mesh_disconnected();
+			mesh_log_stream_on_mesh_disconnected();
+
+			esp_err_t stop_err = esp_mesh_stop();
+			if (stop_err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "mesh reconnect watchdog: esp_mesh_stop failed: %s",
+				         esp_err_to_name(stop_err));
+			}
+
+			vTaskDelay(pdMS_TO_TICKS(1000));
+			note_mesh_disconnected();
+			esp_err_t flush_err = esp_mesh_flush_scan_result();
+			if (flush_err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "mesh reconnect watchdog: scan flush before restart failed: %s",
+				         esp_err_to_name(flush_err));
+			}
+
+			esp_err_t start_err = esp_mesh_start();
+			if (start_err != ESP_OK) {
+				ESP_LOGW(MESH_TAG,
+				         "mesh reconnect watchdog: esp_mesh_start failed: %s",
+				         esp_err_to_name(start_err));
+			}
+		}
+	}
 }
 
 /* -------------------------------------------------------------------------- */
@@ -216,16 +321,17 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_STARTED> ID:" MACSTR,
 		         MAC2STR(id.addr));
-		is_mesh_connected = false;
+		note_mesh_disconnected();
 		mesh_layer = esp_mesh_get_layer();
 	}
 	break;
 
 	case MESH_EVENT_STOPPED: {
 		ESP_LOGI(MESH_TAG, "<MESH_EVENT_STOPPED>");
-		is_mesh_connected = false;
+		note_mesh_disconnected();
 		mesh_layer = esp_mesh_get_layer();
 		mesh_v2_node_on_mesh_disconnected();
+		mesh_log_stream_on_mesh_disconnected();
 	}
 	break;
 
@@ -280,6 +386,7 @@ static void mesh_event_handler(void *arg,
 		esp_mesh_get_id(&id);
 		mesh_layer = conn->self_layer;
 		memcpy(mesh_parent_addr.addr, conn->connected.bssid, 6);
+		note_mesh_connected();
 
 		mesh_v2_node_on_mesh_connected();
 		mesh_log_stream_on_mesh_connected();
@@ -294,7 +401,6 @@ static void mesh_event_handler(void *arg,
 		         MAC2STR(id.addr),
 		         conn->duty);
 		last_layer = mesh_layer;
-		is_mesh_connected = true;
 
 		if (esp_mesh_is_root()) {
 			esp_netif_dhcpc_stop(netif_sta);
@@ -310,9 +416,10 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_PARENT_DISCONNECTED> reason:%d",
 		         disc->reason);
-		is_mesh_connected = false;
+		note_mesh_disconnected();
 		mesh_layer = esp_mesh_get_layer();
 		mesh_v2_node_on_mesh_disconnected();
+		mesh_log_stream_on_mesh_disconnected();
 	}
 	break;
 
@@ -365,7 +472,7 @@ static void mesh_event_handler(void *arg,
 }
 
 /* -------------------------------------------------------------------------- */
-/*  app_main – ініціалізація mesh + Wi-Fi                                     */
+/*  app_main: mesh + Wi-Fi init                                                */
 /* -------------------------------------------------------------------------- */
 
 void app_main(void)
@@ -375,7 +482,7 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-	// Створюємо netif для mesh (sta + softAP, але зберігаємо тільки sta)
+	// Create mesh netifs; keep the STA netif handle.
 	ESP_ERROR_CHECK(
 	    esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
 
@@ -390,11 +497,27 @@ void app_main(void)
 	ESP_ERROR_CHECK(
 	    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
 	                               &mesh_event_handler, NULL));
-        // Звичайний вузол, root’ом не стає
-    ESP_ERROR_CHECK(esp_mesh_fix_root(false));      // можна й не викликати, але так явно
+	mesh_time_sync_init();
+	log_time_vprintf_start();
+	mesh_v2_node_init(MESH_TAG);
+	mesh_log_stream_init(MESH_TAG);
+
+	// Network uses fixed root; only node0 designates itself as MESH_ROOT.
+	ESP_ERROR_CHECK(esp_mesh_fix_root(true));
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
-	ESP_ERROR_CHECK(esp_mesh_set_max_layer(CONFIG_MESH_MAX_LAYER));
+	uint8_t max_layer = CONFIG_MESH_MAX_LAYER;
+#if CHOINKA_DIRECT_ROOT_ONLY
+	if (max_layer > CHOINKA_DIRECT_MAX_LAYER) {
+		max_layer = CHOINKA_DIRECT_MAX_LAYER;
+	}
+#endif
+	ESP_ERROR_CHECK(esp_mesh_set_max_layer(max_layer));
+	ESP_LOGI(MESH_TAG,
+	         "mesh max layer:%u (configured:%u, direct_root_only:%u)",
+	         (unsigned)max_layer,
+	         (unsigned)CONFIG_MESH_MAX_LAYER,
+	         (unsigned)CHOINKA_DIRECT_ROOT_ONLY);
 	ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
 	ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
 
@@ -407,7 +530,7 @@ void app_main(void)
 	// mesh_id
 	memcpy(cfg.mesh_id.addr, MESH_ID, 6);
 
-	// роутер (твій домашній Wi-Fi з menuconfig)
+	// Router-facing Wi-Fi credentials from menuconfig.
 	cfg.channel        = CONFIG_MESH_CHANNEL;
 	cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
 	memcpy(cfg.router.ssid,
@@ -417,7 +540,7 @@ void app_main(void)
 	       CONFIG_MESH_ROUTER_PASSWD,
 	       strlen(CONFIG_MESH_ROUTER_PASSWD));
 
-	// mesh AP (для дітей)
+	// Mesh AP for child nodes.
 	ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
 	cfg.mesh_ap.max_connection        = CONFIG_MESH_AP_CONNECTIONS;
 	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
@@ -428,6 +551,14 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 
 	ESP_ERROR_CHECK(esp_mesh_start());
+	if (!s_mesh_reconnect_task) {
+		xTaskCreate(mesh_reconnect_watchdog_task,
+		            "mesh_reconn",
+		            4096,
+		            NULL,
+		            4,
+		            &s_mesh_reconnect_task);
+	}
 
 	ESP_LOGI(MESH_TAG,
 	         "mesh started, heap:%" PRId32 ", root_fixed:%d, topo:%d %s, ps:%d",
@@ -437,7 +568,7 @@ void app_main(void)
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
 
-		// -------- Підключення вузла помпи --------
+		// -------- Pump node wiring --------
 	pump_node_pins_t pump_pins = {
 		.level_a_gpio = GPIO_NUM_32,   // LEVEL_A_PIN
 		.level_b_gpio = GPIO_NUM_33,   // LEVEL_B_PIN
@@ -445,9 +576,5 @@ void app_main(void)
 	};
 
 	ESP_ERROR_CHECK(pump_node_init(&pump_pins));
-	pump_node_start_task(5);     
-	mesh_time_sync_init();
-	log_time_vprintf_start();     
-	mesh_v2_node_init(MESH_TAG);
-	mesh_log_stream_init(MESH_TAG);
+	pump_node_start_task(5);
 }
