@@ -31,11 +31,21 @@ static uint32_t s_session_id = 0;
 static uint32_t s_next_seq = 1;
 static bool s_inited = false;
 static bool s_root_ready = false;
-static TaskHandle_t s_retx_task = NULL;
+static uint32_t s_last_ack_ms = 0;
+static uint32_t s_last_hello_ms = 0;
 
-#ifndef MESH_V2_RETX_INTERVAL_MS
-#define MESH_V2_RETX_INTERVAL_MS 1000
+#ifndef MESH_V2_ACK_STALE_MS
+#define MESH_V2_ACK_STALE_MS 30000
 #endif
+
+#ifndef MESH_V2_HELLO_RETRY_MS
+#define MESH_V2_HELLO_RETRY_MS 5000
+#endif
+
+static uint32_t ms_now(void)
+{
+	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
 
 static void copy_tag(char *dst, size_t dst_sz, const char *tag)
 {
@@ -149,31 +159,6 @@ static bool ring_copy_locked(uint32_t seq, uint8_t *out, size_t *out_len)
 	return true;
 }
 
-static bool ring_copy_oldest_locked(uint8_t *out, size_t *out_len)
-{
-	uint32_t best_seq = UINT32_MAX;
-	replay_slot_t *best = NULL;
-
-	if (!out || !out_len) {
-		return false;
-	}
-
-	for (uint32_t i = 0; i < MESH_V2_REPLAY_RING_SIZE; i++) {
-		if (s_ring[i].used && s_ring[i].seq < best_seq) {
-			best_seq = s_ring[i].seq;
-			best = &s_ring[i];
-		}
-	}
-
-	if (!best) {
-		return false;
-	}
-
-	memcpy(out, best->bytes, best->len);
-	*out_len = best->len;
-	return true;
-}
-
 static void new_session_locked(void)
 {
 	s_session_id = esp_random();
@@ -183,6 +168,7 @@ static void new_session_locked(void)
 	s_next_seq = 1;
 	memset(s_ring, 0, sizeof(s_ring));
 	s_root_ready = false;
+	s_last_ack_ms = 0;
 }
 
 static esp_err_t send_packet(uint8_t type, const void *payload, size_t payload_len, bool reliable)
@@ -237,29 +223,57 @@ static esp_err_t send_lost(uint32_t missing_seq)
 	return send_packet(MESH_V2_TYPE_LOST, &p, sizeof(p), false);
 }
 
-static void retransmit_task(void *arg)
+static esp_err_t send_hello(bool reset_session)
 {
-	(void)arg;
+	mesh_v2_hello_payload_t p;
+	memset(&p, 0, sizeof(p));
 
-	for (;;) {
-		vTaskDelay(pdMS_TO_TICKS(MESH_V2_RETX_INTERVAL_MS));
+	portENTER_CRITICAL(&s_lock);
+	copy_tag(p.tag, sizeof(p.tag), s_tag);
+	if (reset_session) {
+		new_session_locked();
+	}
+	s_last_hello_ms = ms_now();
+	portEXIT_CRITICAL(&s_lock);
 
-		uint8_t replay[MESH_V2_PACKET_MAX];
-		size_t replay_len = 0;
-		bool found = false;
+	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+	p.mtu = MESH_V2_PACKET_MAX;
+	p.ring_size = MESH_V2_REPLAY_RING_SIZE;
+	p.capabilities = 0;
 
-		portENTER_CRITICAL(&s_lock);
-		if (s_root_ready) {
-			found = ring_copy_oldest_locked(replay, &replay_len);
+	esp_err_t err = send_packet(MESH_V2_TYPE_HELLO, &p, sizeof(p), false);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "HELLO send failed: %s", esp_err_to_name(err));
+	}
+	return err;
+}
+
+static void recover_root_link_if_needed(void)
+{
+	uint32_t now = ms_now();
+	bool send = false;
+	bool reset = false;
+
+	portENTER_CRITICAL(&s_lock);
+	{
+		bool hello_due = s_last_hello_ms == 0 ||
+		                 (uint32_t)(now - s_last_hello_ms) >= MESH_V2_HELLO_RETRY_MS;
+		bool ack_stale = s_root_ready &&
+		                 (s_last_ack_ms == 0 ||
+		                  (uint32_t)(now - s_last_ack_ms) >= MESH_V2_ACK_STALE_MS);
+
+		if ((!s_root_ready && hello_due) || (ack_stale && hello_due)) {
+			send = true;
+			reset = ack_stale;
 		}
-		portEXIT_CRITICAL(&s_lock);
+	}
+	portEXIT_CRITICAL(&s_lock);
 
-		if (found) {
-			mesh_v2_hdr_t *rh = (mesh_v2_hdr_t *)replay;
-			rh->flags |= MESH_V2_FLAG_REPLAY;
-			rh->crc16 = packet_crc(rh, replay + sizeof(mesh_v2_hdr_t));
-			send_raw_to_root(replay, replay_len);
+	if (send) {
+		if (reset) {
+			ESP_LOGW(TAG, "root ACK stale, restarting V2 session");
 		}
+		send_hello(reset);
 	}
 }
 
@@ -272,31 +286,19 @@ void mesh_v2_node_init(const char *tag)
 	}
 	copy_tag(s_tag, sizeof(s_tag), tag);
 	portEXIT_CRITICAL(&s_lock);
-
-	if (!s_retx_task) {
-		xTaskCreate(retransmit_task, "v2_retx", 3072, NULL, 4, &s_retx_task);
-	}
 }
 
 void mesh_v2_node_on_mesh_connected(void)
 {
-	mesh_v2_hello_payload_t p;
-	memset(&p, 0, sizeof(p));
+	send_hello(true);
+}
 
+void mesh_v2_node_on_mesh_disconnected(void)
+{
 	portENTER_CRITICAL(&s_lock);
-	copy_tag(p.tag, sizeof(p.tag), s_tag);
-	new_session_locked();
+	s_root_ready = false;
+	s_last_ack_ms = 0;
 	portEXIT_CRITICAL(&s_lock);
-
-	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-	p.mtu = MESH_V2_PACKET_MAX;
-	p.ring_size = MESH_V2_REPLAY_RING_SIZE;
-	p.capabilities = 0;
-
-	esp_err_t err = send_packet(MESH_V2_TYPE_HELLO, &p, sizeof(p), false);
-	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "HELLO send failed: %s", esp_err_to_name(err));
-	}
 }
 
 bool mesh_v2_node_ready(void)
@@ -312,6 +314,8 @@ esp_err_t mesh_v2_node_send_nodeinfo(void)
 {
 	mesh_v2_nodeinfo_payload_t p;
 	memset(&p, 0, sizeof(p));
+
+	recover_root_link_if_needed();
 
 	portENTER_CRITICAL(&s_lock);
 	copy_tag(p.tag, sizeof(p.tag), s_tag);
@@ -347,6 +351,7 @@ static void handle_ack(uint32_t session_id, uint32_t ack_seq)
 
 	portENTER_CRITICAL(&s_lock);
 	if (session_id == s_session_id) {
+		s_last_ack_ms = ms_now();
 		if (!s_root_ready) {
 			s_root_ready = true;
 			became_ready = true;

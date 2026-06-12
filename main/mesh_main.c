@@ -225,6 +225,7 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGI(MESH_TAG, "<MESH_EVENT_STOPPED>");
 		is_mesh_connected = false;
 		mesh_layer = esp_mesh_get_layer();
+		mesh_v2_node_on_mesh_disconnected();
 	}
 	break;
 
@@ -311,6 +312,7 @@ static void mesh_event_handler(void *arg,
 		         disc->reason);
 		is_mesh_connected = false;
 		mesh_layer = esp_mesh_get_layer();
+		mesh_v2_node_on_mesh_disconnected();
 	}
 	break;
 

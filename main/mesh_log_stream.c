@@ -31,6 +31,7 @@ static bool		s_in_hook = false;
 static char		s_tag[16] = "node";
 
 static uint32_t		s_cnt = 0;
+static TaskHandle_t	s_nodeinfo_task = NULL;
 
 #ifndef LOG_STREAM_STACK_TMP
 	#define LOG_STREAM_STACK_TMP	128
@@ -38,6 +39,10 @@ static uint32_t		s_cnt = 0;
 
 #ifndef LOG_STREAM_HEAP_MAX
 	#define LOG_STREAM_HEAP_MAX	256
+#endif
+
+#ifndef LOG_STREAM_NODEINFO_PERIOD_MS
+	#define LOG_STREAM_NODEINFO_PERIOD_MS	15000
 #endif
 
 static void build_time_prefix(char *out, size_t out_sz)
@@ -97,10 +102,6 @@ static void send_logline_to_root(const char *line)
 {
 	if (!line) return;
 
-	if (mesh_v2_node_ready() && mesh_v2_node_send_log_line(line) == ESP_OK) {
-		return;
-	}
-
 	mesh_log_line_packet_t p;
 	memset(&p, 0, sizeof(p));
 
@@ -141,6 +142,16 @@ static void send_stream_status_to_root(bool enabled)
 	         tprefix,
 	         enabled ? "ready" : "disabled");
 	send_logline_to_root(line);
+}
+
+static void nodeinfo_heartbeat_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(LOG_STREAM_NODEINFO_PERIOD_MS));
+		send_nodeinfo_to_root();
+	}
 }
 
 static int mesh_log_vprintf(const char *fmt, va_list ap)
@@ -230,6 +241,9 @@ void mesh_log_stream_init(const char *tag)
 	}
 
 	s_prev_vprintf = (vprintf_like_t)esp_log_set_vprintf(&mesh_log_vprintf);
+	if (!s_nodeinfo_task) {
+		xTaskCreate(nodeinfo_heartbeat_task, "nodeinfo_hb", 3072, NULL, 4, &s_nodeinfo_task);
+	}
 	ESP_LOGI(TAG, "mesh log stream inited (waiting CTRL)");
 }
 

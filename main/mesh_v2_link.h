@@ -12,6 +12,7 @@ extern "C" {
 
 void mesh_v2_node_init(const char *tag);
 void mesh_v2_node_on_mesh_connected(void);
+void mesh_v2_node_on_mesh_disconnected(void);
 esp_err_t mesh_v2_node_handle_rx(const void *pkt_buf, size_t pkt_len);
 
 bool mesh_v2_node_ready(void);
