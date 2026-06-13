@@ -35,6 +35,11 @@
 #define MESH_RECONNECT_CHECK_MS 5000U
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
+#define ROOT_ACK_FRESH_MS       45000U
+#define ROOT_RECOVERY_BURST_MS  5000U
+#define ROOT_RECOVERY_SOFT_MS   30000U
+#define ROOT_RECOVERY_HARD_MS   90000U
+#define ROOT_RECOVERY_LOG_MS    15000U
 
 #ifndef CONFIG_CHOINKA_DIRECT_ROOT_ONLY
 #define CONFIG_CHOINKA_DIRECT_ROOT_ONLY 0
@@ -61,6 +66,21 @@ static uint32_t   s_disconnected_since_ms = 0;
 static uint32_t   s_last_reconnect_attempt_ms = 0;
 static uint32_t   s_last_mesh_restart_ms = 0;
 static TaskHandle_t s_mesh_reconnect_task = NULL;
+
+typedef enum {
+	ROOT_RECOVERY_OK = 0,
+	ROOT_RECOVERY_WAIT_ACK,
+	ROOT_RECOVERY_NODEINFO_BURST,
+	ROOT_RECOVERY_MESH_RECONNECT,
+	ROOT_RECOVERY_MESH_RESTART,
+} root_recovery_phase_t;
+
+static root_recovery_phase_t s_root_recovery_phase = ROOT_RECOVERY_OK;
+static uint32_t s_root_unhealthy_since_ms = 0;
+static uint32_t s_last_root_burst_ms = 0;
+static uint32_t s_last_root_soft_reconnect_ms = 0;
+static uint32_t s_last_root_hard_restart_ms = 0;
+static uint32_t s_last_root_recovery_log_ms = 0;
 
 /* -------------------------------------------------------------------------- */
 /*  Minimal local protocol                                                    */
@@ -122,6 +142,9 @@ static void note_mesh_disconnected(void)
 		s_disconnected_since_ms = tick_ms();
 	}
 	is_mesh_connected = false;
+	s_root_recovery_phase = ROOT_RECOVERY_OK;
+	s_root_unhealthy_since_ms = 0;
+	s_last_root_burst_ms = 0;
 }
 
 static void note_mesh_connected(void)
@@ -129,6 +152,60 @@ static void note_mesh_connected(void)
 	is_mesh_connected = true;
 	s_disconnected_since_ms = 0;
 	s_last_reconnect_attempt_ms = 0;
+	s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
+	s_root_unhealthy_since_ms = tick_ms();
+	s_last_root_burst_ms = 0;
+	s_last_root_soft_reconnect_ms = 0;
+	s_last_root_hard_restart_ms = 0;
+	s_last_root_recovery_log_ms = 0;
+}
+
+static const char *root_recovery_phase_name(root_recovery_phase_t phase)
+{
+	switch (phase) {
+	case ROOT_RECOVERY_OK: return "ok";
+	case ROOT_RECOVERY_WAIT_ACK: return "wait_ack";
+	case ROOT_RECOVERY_NODEINFO_BURST: return "nodeinfo_burst";
+	case ROOT_RECOVERY_MESH_RECONNECT: return "mesh_reconnect";
+	case ROOT_RECOVERY_MESH_RESTART: return "mesh_restart";
+	default: return "unknown";
+	}
+}
+
+static void root_recovery_reset_ok(uint32_t now)
+{
+	if (s_root_recovery_phase != ROOT_RECOVERY_OK && s_root_unhealthy_since_ms != 0) {
+		uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
+		ESP_LOGI(MESH_TAG,
+		         "root recovery: restored after %lu ms, ack_age=%lu",
+		         (unsigned long)down_ms,
+		         (unsigned long)mesh_v2_node_ack_age_ms());
+	}
+	s_root_recovery_phase = ROOT_RECOVERY_OK;
+	s_root_unhealthy_since_ms = 0;
+	s_last_root_burst_ms = 0;
+	s_last_root_soft_reconnect_ms = 0;
+	s_last_root_hard_restart_ms = 0;
+	s_last_root_recovery_log_ms = 0;
+}
+
+static void root_recovery_log_throttled(uint32_t now, uint32_t down_ms,
+                                        root_recovery_phase_t phase,
+                                        const char *action,
+                                        esp_err_t last_err)
+{
+	if (s_last_root_recovery_log_ms != 0 &&
+	    (uint32_t)(now - s_last_root_recovery_log_ms) < ROOT_RECOVERY_LOG_MS) {
+		return;
+	}
+	s_last_root_recovery_log_ms = now;
+	ESP_LOGW(MESH_TAG,
+	         "root recovery: phase=%s down=%lu ms ack_age=%lu last_send=%s action=%s",
+	         root_recovery_phase_name(phase),
+	         (unsigned long)down_ms,
+	         (unsigned long)mesh_v2_node_ack_age_ms(),
+	         esp_err_to_name(last_err),
+	         action ? action : "watch");
 }
 
 static void ota_mark_running_app_valid_if_pending(void)
@@ -260,6 +337,97 @@ static esp_err_t mesh_comm_start(void)
 	return ESP_OK;
 }
 
+static void root_liveness_watchdog_step(void)
+{
+	uint32_t now = tick_ms();
+
+	if (!is_mesh_connected) {
+		return;
+	}
+
+	if (mesh_v2_node_ack_fresh(ROOT_ACK_FRESH_MS)) {
+		root_recovery_reset_ok(now);
+		return;
+	}
+
+	if (s_root_unhealthy_since_ms == 0) {
+		s_root_unhealthy_since_ms = now;
+	}
+
+	uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
+	root_recovery_phase_t phase = ROOT_RECOVERY_WAIT_ACK;
+
+	if (down_ms >= ROOT_RECOVERY_HARD_MS) {
+		phase = ROOT_RECOVERY_MESH_RESTART;
+	} else if (down_ms >= ROOT_RECOVERY_SOFT_MS) {
+		phase = ROOT_RECOVERY_MESH_RECONNECT;
+	} else if (down_ms >= ROOT_RECOVERY_BURST_MS) {
+		phase = ROOT_RECOVERY_NODEINFO_BURST;
+	}
+	s_root_recovery_phase = phase;
+
+	if (s_last_root_burst_ms == 0 ||
+	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
+		s_last_root_burst_ms = now;
+		mesh_v2_node_kick_root();
+		update_v2_topology(false);
+		esp_err_t err = mesh_log_stream_send_nodeinfo_now();
+		(void)mesh_v2_node_send_topology();
+		root_recovery_log_throttled(now, down_ms, phase, "nodeinfo_burst", err);
+	}
+
+	if (down_ms >= ROOT_RECOVERY_HARD_MS &&
+	    (s_last_root_hard_restart_ms == 0 ||
+	     (uint32_t)(now - s_last_root_hard_restart_ms) >= ROOT_RECOVERY_HARD_MS)) {
+		s_last_root_hard_restart_ms = now;
+		root_recovery_log_throttled(now, down_ms, ROOT_RECOVERY_MESH_RESTART,
+		                            "mesh_stop_start",
+		                            mesh_log_stream_last_send_err());
+		mesh_v2_node_on_mesh_disconnected();
+		mesh_log_stream_on_mesh_disconnected();
+
+		esp_err_t stop_err = esp_mesh_stop();
+		if (stop_err != ESP_OK) {
+			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_stop failed: %s",
+			         esp_err_to_name(stop_err));
+		}
+		vTaskDelay(pdMS_TO_TICKS(1000));
+		note_mesh_disconnected();
+		(void)esp_mesh_flush_scan_result();
+		esp_err_t start_err = esp_mesh_start();
+		if (start_err != ESP_OK) {
+			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_start failed: %s",
+			         esp_err_to_name(start_err));
+		}
+		return;
+	}
+
+	if (down_ms >= ROOT_RECOVERY_SOFT_MS &&
+	    (s_last_root_soft_reconnect_ms == 0 ||
+	     (uint32_t)(now - s_last_root_soft_reconnect_ms) >= ROOT_RECOVERY_SOFT_MS)) {
+		s_last_root_soft_reconnect_ms = now;
+		root_recovery_log_throttled(now, down_ms, ROOT_RECOVERY_MESH_RECONNECT,
+		                            "mesh_disconnect_connect",
+		                            mesh_log_stream_last_send_err());
+		esp_err_t disc_err = esp_mesh_disconnect();
+		if (disc_err != ESP_OK) {
+			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_disconnect failed: %s",
+			         esp_err_to_name(disc_err));
+		} else {
+			mesh_v2_node_on_mesh_disconnected();
+			mesh_log_stream_on_mesh_disconnected();
+		}
+		vTaskDelay(pdMS_TO_TICKS(250));
+		(void)esp_mesh_flush_scan_result();
+		esp_err_t conn_err = esp_mesh_connect();
+		if (conn_err != ESP_OK) {
+			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_connect failed: %s",
+			         esp_err_to_name(conn_err));
+		}
+		return;
+	}
+}
+
 static void mesh_reconnect_watchdog_task(void *arg)
 {
 	(void)arg;
@@ -268,6 +436,7 @@ static void mesh_reconnect_watchdog_task(void *arg)
 		vTaskDelay(pdMS_TO_TICKS(MESH_RECONNECT_CHECK_MS));
 
 		if (is_mesh_connected) {
+			root_liveness_watchdog_step();
 			continue;
 		}
 

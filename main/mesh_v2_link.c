@@ -539,6 +539,41 @@ bool mesh_v2_node_ready(void)
 	return ready;
 }
 
+uint32_t mesh_v2_node_ack_age_ms(void)
+{
+	uint32_t last_ack = 0;
+
+	portENTER_CRITICAL(&s_lock);
+	last_ack = s_last_ack_ms;
+	portEXIT_CRITICAL(&s_lock);
+
+	if (last_ack == 0) {
+		return UINT32_MAX;
+	}
+	return (uint32_t)(ms_now() - last_ack);
+}
+
+bool mesh_v2_node_ack_fresh(uint32_t max_age_ms)
+{
+	bool ready = false;
+	uint32_t last_ack = 0;
+
+	portENTER_CRITICAL(&s_lock);
+	ready = s_root_ready;
+	last_ack = s_last_ack_ms;
+	portEXIT_CRITICAL(&s_lock);
+
+	if (!ready || last_ack == 0) {
+		return false;
+	}
+	return (uint32_t)(ms_now() - last_ack) <= max_age_ms;
+}
+
+void mesh_v2_node_kick_root(void)
+{
+	recover_root_link_if_needed();
+}
+
 esp_err_t mesh_v2_node_send_nodeinfo(void)
 {
 	mesh_v2_tunnel_nodeinfo_payload_t p;

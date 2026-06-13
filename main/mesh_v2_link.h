@@ -22,6 +22,9 @@ void mesh_v2_node_update_topology(const uint8_t parent_mac[6],
                                   uint8_t child_count);
 
 bool mesh_v2_node_ready(void);
+bool mesh_v2_node_ack_fresh(uint32_t max_age_ms);
+uint32_t mesh_v2_node_ack_age_ms(void);
+void mesh_v2_node_kick_root(void);
 esp_err_t mesh_v2_node_send_nodeinfo(void);
 esp_err_t mesh_v2_node_send_log_line(const char *line);
 esp_err_t mesh_v2_node_send_topology(void);

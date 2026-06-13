@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "sdkconfig.h"
+
 #include "mesh_proto.h"
 #include "mesh_v2_link.h"
 
@@ -33,6 +35,7 @@ static char		s_tag[16] = "node";
 
 static uint32_t		s_cnt = 0;
 static TaskHandle_t	s_nodeinfo_task = NULL;
+static esp_err_t	s_last_send_err = ESP_OK;
 
 #ifndef LOG_STREAM_STACK_TMP
 	#define LOG_STREAM_STACK_TMP	128
@@ -44,6 +47,10 @@ static TaskHandle_t	s_nodeinfo_task = NULL;
 
 #ifndef LOG_STREAM_NODEINFO_PERIOD_MS
 	#define LOG_STREAM_NODEINFO_PERIOD_MS	15000
+#endif
+
+#ifndef CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE
+	#define CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE 0
 #endif
 
 static void build_time_prefix(char *out, size_t out_sz)
@@ -66,10 +73,16 @@ static void build_time_prefix(char *out, size_t out_sz)
 	if (n == 0) snprintf(out, out_sz, "[no-time] ");
 }
 
-static void send_nodeinfo_to_root(void)
+static void record_send_result(esp_err_t err)
+{
+	s_last_send_err = err;
+}
+
+static esp_err_t send_nodeinfo_to_root(void)
 {
 	if (!s_mesh_connected) {
-		return;
+		record_send_result(ESP_ERR_INVALID_STATE);
+		return ESP_ERR_INVALID_STATE;
 	}
 
 	(void)mesh_v2_node_send_nodeinfo();
@@ -99,7 +112,9 @@ static void send_nodeinfo_to_root(void)
 
 	// Keep V1 NODEINFO alive as a compatibility beacon. It makes the node
 	// visible even while V2 is recovering after a root reboot.
-	(void)esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	esp_err_t err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	record_send_result(err);
+	return err;
 }
 
 static void send_logline_to_root(const char *line)
@@ -107,9 +122,13 @@ static void send_logline_to_root(const char *line)
 	if (!line) return;
 	if (!s_mesh_connected) return;
 
+#if CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE
 	if (mesh_v2_node_send_log_line(line) == ESP_OK) {
 		return;
 	}
+#else
+	mesh_v2_node_kick_root();
+#endif
 
 	mesh_log_line_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -137,7 +156,7 @@ static void send_logline_to_root(const char *line)
 	mesh_addr_t dest;
 	memset(&dest, 0, sizeof(dest)); // root
 
-	esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	record_send_result(esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0));
 }
 
 static void send_stream_status_to_root(bool enabled)
@@ -159,7 +178,7 @@ static void nodeinfo_heartbeat_task(void *arg)
 
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(LOG_STREAM_NODEINFO_PERIOD_MS));
-		send_nodeinfo_to_root();
+		(void)send_nodeinfo_to_root();
 		(void)mesh_v2_node_send_topology();
 	}
 }
@@ -260,13 +279,23 @@ void mesh_log_stream_init(const char *tag)
 void mesh_log_stream_on_mesh_connected(void)
 {
 	s_mesh_connected = true;
-	send_nodeinfo_to_root();
+	(void)send_nodeinfo_to_root();
 }
 
 void mesh_log_stream_on_mesh_disconnected(void)
 {
 	s_mesh_connected = false;
 	s_stream_enabled = false;
+}
+
+esp_err_t mesh_log_stream_send_nodeinfo_now(void)
+{
+	return send_nodeinfo_to_root();
+}
+
+esp_err_t mesh_log_stream_last_send_err(void)
+{
+	return s_last_send_err;
 }
 
 esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
@@ -288,7 +317,7 @@ esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
 	s_stream_enabled = enable;
 
 	if (enable) {
-		send_nodeinfo_to_root();
+		(void)send_nodeinfo_to_root();
 		send_stream_status_to_root(true);
 	}
 

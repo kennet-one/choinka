@@ -114,6 +114,14 @@ menu "Example Configuration"
         help
             Max layer used when CHOINKA_DIRECT_ROOT_ONLY is enabled.
 
+    config CHOINKA_V2_LOG_TUNNEL_ENABLE
+        bool "Send log lines through V2 tunnel"
+        default n
+        help
+            Keep disabled during the stabilization pass. NODEINFO, HELLO and
+            TOPOLOGY still use V2, while remote log lines use the older V1
+            stream path so log traffic cannot destabilize V2 recovery.
+
     config MESH_CHANNEL
         int "channel"
         range 0 14
