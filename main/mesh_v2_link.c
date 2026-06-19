@@ -637,6 +637,73 @@ esp_err_t mesh_v2_node_send_topology(void)
 	return send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
 }
 
+static esp_err_t mesh_v2_node_send_task_snapshot(uint32_t request_id)
+{
+	enum { TASK_SLOT_COUNT = 25 };
+	static TaskStatus_t tasks[TASK_SLOT_COUNT];
+	UBaseType_t count = 0;
+	uint32_t total_time = 0;
+	char tag[MESH_V2_TAG_MAX];
+	esp_err_t first_err = ESP_OK;
+
+	memset(tasks, 0, sizeof(tasks));
+	count = uxTaskGetSystemState(tasks, TASK_SLOT_COUNT, &total_time);
+	if (count > TASK_SLOT_COUNT) {
+		count = TASK_SLOT_COUNT;
+	}
+
+	portENTER_CRITICAL(&s_lock);
+	copy_tag(tag, sizeof(tag), s_tag);
+	portEXIT_CRITICAL(&s_lock);
+
+	for (UBaseType_t start = 0; start < count || start == 0; start += MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES) {
+		mesh_v2_task_snapshot_payload_t p;
+		memset(&p, 0, sizeof(p));
+
+		copy_tag(p.tag, sizeof(p.tag), tag);
+		p.request_id = request_id;
+		p.updated_ms = ms_now();
+		p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+		p.cpu_valid = 0;
+		p.cpu_load_x10 = 0;
+		p.slot_count = TASK_SLOT_COUNT;
+		p.task_total = (uint16_t)count;
+		p.task_index = (uint16_t)start;
+
+		UBaseType_t left = count > start ? (count - start) : 0;
+		if (left > MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES) {
+			left = MESH_V2_TASK_SNAPSHOT_MAX_ENTRIES;
+		}
+		p.task_count = (uint8_t)left;
+		if (start + left >= count) {
+			p.flags |= MESH_V2_TASK_SNAPSHOT_FLAG_LAST;
+		}
+
+		for (UBaseType_t i = 0; i < left; i++) {
+			const TaskStatus_t *src = &tasks[start + i];
+			mesh_v2_task_entry_t *dst = &p.tasks[i];
+			const char *name = src->pcTaskName && src->pcTaskName[0]
+				? src->pcTaskName
+				: "noname";
+			copy_tag(dst->name, sizeof(dst->name), name);
+			dst->priority = (uint32_t)src->uxCurrentPriority;
+			dst->free_words = (uint32_t)src->usStackHighWaterMark;
+			dst->cpu_x10 = -1;
+		}
+
+		esp_err_t err = send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TASK, &p, sizeof(p), true);
+		if (err != ESP_OK && first_err == ESP_OK) {
+			first_err = err;
+		}
+
+		if (count == 0) {
+			break;
+		}
+	}
+
+	return first_err;
+}
+
 static void handle_ack(uint32_t session_id, uint32_t ack_seq)
 {
 	bool became_ready = false;
@@ -755,6 +822,19 @@ static void handle_tunnel_nack(const mesh_v2_hdr_t *h, const uint8_t *payload)
 
 static void deliver_tunnel_payload(const mesh_v2_tunnel_hdr_t *t, const uint8_t *payload)
 {
+	if (t->channel_id == MESH_V2_TUNNEL_CHANNEL_TASK) {
+		if (t->payload_len < sizeof(mesh_v2_task_request_payload_t)) {
+			return;
+		}
+		const mesh_v2_task_request_payload_t *req =
+			(const mesh_v2_task_request_payload_t *)payload;
+		esp_err_t err = mesh_v2_node_send_task_snapshot(req->request_id);
+		if (err != ESP_OK) {
+			ESP_LOGW(TAG, "task snapshot send failed: %s", esp_err_to_name(err));
+		}
+		return;
+	}
+
 	if (t->channel_id != MESH_V2_TUNNEL_CHANNEL_CONTROL) {
 		return;
 	}
