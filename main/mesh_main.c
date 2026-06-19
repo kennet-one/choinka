@@ -14,6 +14,7 @@
 #include "esp_mesh_internal.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 
 #include "legacy_proto.h"
@@ -40,6 +41,9 @@
 #define ROOT_RECOVERY_SOFT_MS   30000U
 #define ROOT_RECOVERY_HARD_MS   90000U
 #define ROOT_RECOVERY_LOG_MS    15000U
+#define MANUAL_REBOOT_DELAY_MIN_MS 500U
+#define MANUAL_REBOOT_DELAY_MAX_MS 5000U
+#define MANUAL_REBOOT_DELAY_DEFAULT_MS 1200U
 
 #ifndef CONFIG_CHOINKA_DIRECT_ROOT_ONLY
 #define CONFIG_CHOINKA_DIRECT_ROOT_ONLY 0
@@ -81,6 +85,8 @@ static uint32_t s_last_root_burst_ms = 0;
 static uint32_t s_last_root_soft_reconnect_ms = 0;
 static uint32_t s_last_root_hard_restart_ms = 0;
 static uint32_t s_last_root_recovery_log_ms = 0;
+static bool s_manual_reboot_pending = false;
+static uint16_t s_manual_reboot_delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
 
 /* -------------------------------------------------------------------------- */
 /*  Minimal local protocol                                                    */
@@ -225,6 +231,92 @@ static void ota_mark_running_app_valid_if_pending(void)
 	}
 }
 
+static esp_err_t send_reboot_status(uint16_t seq, uint8_t code, const char *msg)
+{
+	mesh_reboot_status_packet_t p;
+	memset(&p, 0, sizeof(p));
+
+	p.h.magic = MESH_PKT_MAGIC;
+	p.h.version = MESH_PKT_VERSION;
+	p.h.type = MESH_REBOOT_TYPE_STATUS;
+	p.h.counter = tick_ms();
+	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
+	p.code = code;
+	p.seq = seq;
+	if (msg) {
+		strncpy(p.message, msg, sizeof(p.message) - 1);
+		p.message[sizeof(p.message) - 1] = '\0';
+	}
+
+	mesh_data_t data;
+	memset(&data, 0, sizeof(data));
+	data.data = (uint8_t *)&p;
+	data.size = sizeof(p);
+	data.proto = MESH_PROTO_BIN;
+	data.tos = MESH_TOS_P2P;
+
+	mesh_addr_t dest;
+	memset(&dest, 0, sizeof(dest));
+
+	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+}
+
+static void manual_reboot_task(void *arg)
+{
+	(void)arg;
+	uint16_t delay_ms = s_manual_reboot_delay_ms;
+	if (delay_ms < MANUAL_REBOOT_DELAY_MIN_MS ||
+	    delay_ms > MANUAL_REBOOT_DELAY_MAX_MS) {
+		delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
+	}
+
+	vTaskDelay(pdMS_TO_TICKS(delay_ms));
+	esp_restart();
+}
+
+static void handle_reboot_request(const mesh_reboot_request_packet_t *p,
+                                  size_t pkt_len)
+{
+	if (!p || pkt_len < sizeof(*p)) {
+		ESP_LOGW(MESH_TAG, "RX REBOOT short: %u bytes", (unsigned)pkt_len);
+		return;
+	}
+
+	char reason[MESH_REBOOT_REASON_MAX + 1];
+	memcpy(reason, p->reason, sizeof(p->reason));
+	reason[sizeof(reason) - 1] = '\0';
+
+	if (s_manual_reboot_pending) {
+		(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_BUSY,
+		                         "manual reboot already pending");
+		return;
+	}
+
+	uint16_t delay_ms = p->delay_ms;
+	if (delay_ms < MANUAL_REBOOT_DELAY_MIN_MS ||
+	    delay_ms > MANUAL_REBOOT_DELAY_MAX_MS) {
+		delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
+	}
+
+	s_manual_reboot_pending = true;
+	s_manual_reboot_delay_ms = delay_ms;
+
+	BaseType_t task_ok = xTaskCreate(manual_reboot_task, "manual_reboot",
+	                                 2048, NULL, 6, NULL);
+	if (task_ok != pdPASS) {
+		s_manual_reboot_pending = false;
+		(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_ERROR,
+		                         "reboot task failed");
+		return;
+	}
+
+	ESP_LOGW(MESH_TAG, "manual reboot requested: seq=%u delay=%u reason=%s",
+	         (unsigned)p->seq, (unsigned)delay_ms,
+	         reason[0] ? reason : "none");
+	(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_OK,
+	                         "manual reboot accepted");
+}
+
 /* -------------------------------------------------------------------------- */
 /*  RX task: receive packets from other nodes                                  */
 /* -------------------------------------------------------------------------- */
@@ -277,6 +369,12 @@ static void mesh_rx_task(void *arg)
 
 		if (h->type == MESH_LOG_TYPE_CTRL) {
 			mesh_log_stream_handle_rx(rx_buf, data.size);
+			continue;
+		}
+
+		if (h->type == MESH_REBOOT_TYPE_REQUEST) {
+			handle_reboot_request((const mesh_reboot_request_packet_t *)rx_buf,
+			                      data.size);
 			continue;
 		}
 
@@ -716,8 +814,8 @@ void app_main(void)
 	mesh_v2_node_init(MESH_TAG);
 	mesh_log_stream_init(MESH_TAG);
 
-	// Network uses fixed root; only node0 designates itself as MESH_ROOT.
-	ESP_ERROR_CHECK(esp_mesh_fix_root(true));
+	// This is a regular remote node. Only node0 fixes itself as MESH_ROOT.
+	ESP_ERROR_CHECK(esp_mesh_fix_root(false));
 
 	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
 	mesh_max_layer = CONFIG_MESH_MAX_LAYER;
