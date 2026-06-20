@@ -36,11 +36,12 @@
 #define MESH_RECONNECT_CHECK_MS 5000U
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
-#define ROOT_ACK_FRESH_MS       45000U
-#define ROOT_V1_FRESH_MS        45000U
+#define ROOT_ACK_FRESH_MS       30000U
+#define ROOT_V1_FRESH_MS        30000U
 #define ROOT_RECOVERY_BURST_MS  5000U
-#define ROOT_RECOVERY_SOFT_MS   30000U
-#define ROOT_RECOVERY_HARD_MS   90000U
+#define ROOT_RECOVERY_RESET_MS  15000U
+#define ROOT_RECOVERY_SOFT_MS   20000U
+#define ROOT_RECOVERY_HARD_MS   45000U
 #define ROOT_RECOVERY_LOG_MS    15000U
 #define MANUAL_REBOOT_DELAY_MIN_MS 500U
 #define MANUAL_REBOOT_DELAY_MAX_MS 5000U
@@ -475,12 +476,15 @@ static void root_liveness_watchdog_step(void)
 		if (s_last_root_burst_ms == 0 ||
 		    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
 			s_last_root_burst_ms = now;
-			(void)mesh_v2_node_force_hello(false);
+			bool reset_v2_session = down_ms >= ROOT_RECOVERY_RESET_MS;
+			(void)mesh_v2_node_force_hello(reset_v2_session);
 			update_v2_topology(false);
 			esp_err_t err = mesh_log_stream_send_nodeinfo_now();
 			(void)mesh_v2_node_send_topology();
 			root_recovery_log_throttled(now, down_ms, phase,
-			                            "hello_nodeinfo_tx_wait_ack",
+			                            reset_v2_session
+			                            ? "hello_reset_nodeinfo_tx_wait_ack"
+			                            : "hello_nodeinfo_tx_wait_ack",
 			                            err);
 		}
 		return;
@@ -489,11 +493,16 @@ static void root_liveness_watchdog_step(void)
 	if (s_last_root_burst_ms == 0 ||
 	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
 		s_last_root_burst_ms = now;
-		(void)mesh_v2_node_force_hello(false);
+		bool reset_v2_session = down_ms >= ROOT_RECOVERY_RESET_MS;
+		(void)mesh_v2_node_force_hello(reset_v2_session);
 		update_v2_topology(false);
 		esp_err_t err = mesh_log_stream_send_nodeinfo_now();
 		(void)mesh_v2_node_send_topology();
-		root_recovery_log_throttled(now, down_ms, phase, "nodeinfo_burst", err);
+		root_recovery_log_throttled(now, down_ms, phase,
+		                            reset_v2_session
+		                            ? "hello_reset_nodeinfo_burst"
+		                            : "nodeinfo_burst",
+		                            err);
 	}
 
 	if (down_ms >= ROOT_RECOVERY_HARD_MS &&
