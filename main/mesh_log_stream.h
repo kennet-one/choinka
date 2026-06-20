@@ -1,5 +1,8 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -15,7 +18,11 @@ void mesh_log_stream_on_mesh_disconnected(void);
 
 // Best-effort immediate NODEINFO beacon used by recovery watchdogs.
 esp_err_t mesh_log_stream_send_nodeinfo_now(void);
+void mesh_log_stream_kick_nodeinfo_burst(void);
 esp_err_t mesh_log_stream_last_send_err(void);
+uint32_t mesh_log_stream_root_ok_age_ms(void);
+bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms);
+bool mesh_log_stream_enabled(void);
 
 // Call from mesh_rx_task() when MESH_LOG_TYPE_CTRL is received.
 esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len);

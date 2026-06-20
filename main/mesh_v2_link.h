@@ -25,6 +25,7 @@ bool mesh_v2_node_ready(void);
 bool mesh_v2_node_ack_fresh(uint32_t max_age_ms);
 uint32_t mesh_v2_node_ack_age_ms(void);
 void mesh_v2_node_kick_root(void);
+void mesh_v2_node_set_recovery_phase(uint8_t phase);
 esp_err_t mesh_v2_node_send_nodeinfo(void);
 esp_err_t mesh_v2_node_send_log_line(const char *line);
 esp_err_t mesh_v2_node_send_topology(void);

@@ -53,6 +53,7 @@ static uint16_t s_layer = 0;
 static uint16_t s_max_layer = 0;
 static int8_t s_parent_rssi = -127;
 static uint8_t s_child_count = 0;
+static uint8_t s_recovery_phase = 0;
 static uint32_t s_tunnel_gap_count = 0;
 static uint32_t s_tunnel_lost_count = 0;
 static uint32_t s_tunnel_replay_count = 0;
@@ -553,6 +554,13 @@ uint32_t mesh_v2_node_ack_age_ms(void)
 	return (uint32_t)(ms_now() - last_ack);
 }
 
+void mesh_v2_node_set_recovery_phase(uint8_t phase)
+{
+	portENTER_CRITICAL(&s_lock);
+	s_recovery_phase = phase;
+	portEXIT_CRITICAL(&s_lock);
+}
+
 bool mesh_v2_node_ack_fresh(uint32_t max_age_ms)
 {
 	bool ready = false;
@@ -629,10 +637,15 @@ esp_err_t mesh_v2_node_send_topology(void)
 	p.gap_count = s_tunnel_gap_count;
 	p.lost_count = s_tunnel_lost_count;
 	p.replay_count = s_tunnel_replay_count;
+	p.recovery_phase = s_recovery_phase;
 	portEXIT_CRITICAL(&s_lock);
 
 	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 	p.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
+	p.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
+	p.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
+	p.last_send_err = (int32_t)mesh_log_stream_last_send_err();
+	p.log_stream_enabled = mesh_log_stream_enabled() ? 1 : 0;
 
 	return send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
 }

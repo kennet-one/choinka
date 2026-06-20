@@ -37,6 +37,7 @@
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
 #define ROOT_ACK_FRESH_MS       45000U
+#define ROOT_V1_FRESH_MS        45000U
 #define ROOT_RECOVERY_BURST_MS  5000U
 #define ROOT_RECOVERY_SOFT_MS   30000U
 #define ROOT_RECOVERY_HARD_MS   90000U
@@ -149,6 +150,7 @@ static void note_mesh_disconnected(void)
 	}
 	is_mesh_connected = false;
 	s_root_recovery_phase = ROOT_RECOVERY_OK;
+	mesh_v2_node_set_recovery_phase((uint8_t)ROOT_RECOVERY_OK);
 	s_root_unhealthy_since_ms = 0;
 	s_last_root_burst_ms = 0;
 }
@@ -159,6 +161,7 @@ static void note_mesh_connected(void)
 	s_disconnected_since_ms = 0;
 	s_last_reconnect_attempt_ms = 0;
 	s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
+	mesh_v2_node_set_recovery_phase((uint8_t)s_root_recovery_phase);
 	s_root_unhealthy_since_ms = tick_ms();
 	s_last_root_burst_ms = 0;
 	s_last_root_soft_reconnect_ms = 0;
@@ -205,6 +208,7 @@ static void root_recovery_log_throttled(uint32_t now, uint32_t down_ms,
 		return;
 	}
 	s_last_root_recovery_log_ms = now;
+	mesh_v2_node_set_recovery_phase((uint8_t)phase);
 	ESP_LOGW(MESH_TAG,
 	         "root recovery: phase=%s down=%lu ms ack_age=%lu last_send=%s action=%s",
 	         root_recovery_phase_name(phase),
@@ -448,6 +452,23 @@ static void root_liveness_watchdog_step(void)
 		return;
 	}
 
+	if (mesh_log_stream_root_ok_fresh(ROOT_V1_FRESH_MS)) {
+		s_root_unhealthy_since_ms = 0;
+		s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
+		mesh_v2_node_set_recovery_phase((uint8_t)s_root_recovery_phase);
+		if (s_last_root_burst_ms == 0 ||
+		    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
+			s_last_root_burst_ms = now;
+			mesh_v2_node_kick_root();
+			update_v2_topology(false);
+			(void)mesh_v2_node_send_topology();
+			root_recovery_log_throttled(now, 0, ROOT_RECOVERY_WAIT_ACK,
+			                            "v2_hello_retry_v1_ok",
+			                            mesh_log_stream_last_send_err());
+		}
+		return;
+	}
+
 	if (s_root_unhealthy_since_ms == 0) {
 		s_root_unhealthy_since_ms = now;
 	}
@@ -463,6 +484,7 @@ static void root_liveness_watchdog_step(void)
 		phase = ROOT_RECOVERY_NODEINFO_BURST;
 	}
 	s_root_recovery_phase = phase;
+	mesh_v2_node_set_recovery_phase((uint8_t)phase);
 
 	if (s_last_root_burst_ms == 0 ||
 	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
@@ -754,6 +776,7 @@ static void mesh_event_handler(void *arg,
 		         "<MESH_EVENT_ROOT_ADDRESS> root:" MACSTR,
 		         MAC2STR(ra->addr));
 		update_v2_topology(true);
+		mesh_log_stream_kick_nodeinfo_burst();
 	}
 	break;
 
