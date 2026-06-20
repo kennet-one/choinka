@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+esp_err_t mesh_ota_receiver_start(void);
 esp_err_t mesh_ota_receiver_handle_rx(const void *pkt_buf, size_t pkt_len);
 
 #ifdef __cplusplus

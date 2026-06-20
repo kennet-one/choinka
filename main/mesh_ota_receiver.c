@@ -14,6 +14,7 @@
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "mesh_proto.h"
@@ -37,6 +38,8 @@ static uint32_t s_status_counter = 0;
 static bool s_reboot_pending = false;
 static uint16_t s_reboot_end_seq = 0;
 static uint32_t s_reboot_total = 0;
+static SemaphoreHandle_t s_ota_lock = NULL;
+static TaskHandle_t s_ota_watchdog_task = NULL;
 
 static void copy_packet_text(char *dst, size_t dst_sz, const char *src, size_t src_sz)
 {
@@ -164,7 +167,48 @@ static void finish_stale_abort(void)
 
 	ESP_LOGW(TAG, "remote OTA timed out after %u ms, aborting partial image",
 	         (unsigned)MESH_OTA_RX_TIMEOUT_MS);
+	send_status(MESH_OTA_OP_ABORT, MESH_OTA_STATUS_ERROR, s_ota.last_seq,
+	            s_ota.written, s_ota.image_size, "OTA timeout abort");
 	finish_abort();
+}
+
+static void ota_watchdog_task(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		vTaskDelay(pdMS_TO_TICKS(5000));
+		if (!s_ota_lock) {
+			continue;
+		}
+		if (xSemaphoreTake(s_ota_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+			continue;
+		}
+		finish_stale_abort();
+		xSemaphoreGive(s_ota_lock);
+	}
+}
+
+esp_err_t mesh_ota_receiver_start(void)
+{
+	if (!s_ota_lock) {
+		s_ota_lock = xSemaphoreCreateMutex();
+		if (!s_ota_lock) {
+			return ESP_ERR_NO_MEM;
+		}
+	}
+
+	if (s_ota_watchdog_task) {
+		return ESP_OK;
+	}
+
+	if (xTaskCreate(ota_watchdog_task, "ota_rx_watch", 3072, NULL, 4,
+	                &s_ota_watchdog_task) != pdPASS) {
+		s_ota_watchdog_task = NULL;
+		return ESP_ERR_NO_MEM;
+	}
+
+	return ESP_OK;
 }
 
 static void reboot_task(void *arg)
@@ -392,26 +436,46 @@ esp_err_t mesh_ota_receiver_handle_rx(const void *pkt_buf, size_t pkt_len)
 	if (!pkt_buf || pkt_len < sizeof(mesh_pkt_hdr_t)) {
 		return ESP_ERR_INVALID_SIZE;
 	}
+	if (!s_ota_lock) {
+		return ESP_ERR_INVALID_STATE;
+	}
 
 	const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)pkt_buf;
 	if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION) {
 		return ESP_ERR_INVALID_ARG;
 	}
 
+	if (xSemaphoreTake(s_ota_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+		return ESP_ERR_TIMEOUT;
+	}
+
+	esp_err_t ret = ESP_ERR_INVALID_ARG;
 	switch (h->type) {
 	case MESH_OTA_TYPE_BEGIN:
-		if (pkt_len < sizeof(mesh_ota_begin_packet_t)) return ESP_ERR_INVALID_SIZE;
-		return handle_begin((const mesh_ota_begin_packet_t *)pkt_buf, pkt_len);
+		ret = (pkt_len < sizeof(mesh_ota_begin_packet_t))
+		      ? ESP_ERR_INVALID_SIZE
+		      : handle_begin((const mesh_ota_begin_packet_t *)pkt_buf, pkt_len);
+		break;
 	case MESH_OTA_TYPE_DATA:
-		if (pkt_len < offsetof(mesh_ota_data_packet_t, data)) return ESP_ERR_INVALID_SIZE;
-		return handle_data((const mesh_ota_data_packet_t *)pkt_buf, pkt_len);
+		ret = (pkt_len < offsetof(mesh_ota_data_packet_t, data))
+		      ? ESP_ERR_INVALID_SIZE
+		      : handle_data((const mesh_ota_data_packet_t *)pkt_buf, pkt_len);
+		break;
 	case MESH_OTA_TYPE_END:
-		if (pkt_len < sizeof(mesh_ota_end_packet_t)) return ESP_ERR_INVALID_SIZE;
-		return handle_end((const mesh_ota_end_packet_t *)pkt_buf, pkt_len);
+		ret = (pkt_len < sizeof(mesh_ota_end_packet_t))
+		      ? ESP_ERR_INVALID_SIZE
+		      : handle_end((const mesh_ota_end_packet_t *)pkt_buf, pkt_len);
+		break;
 	case MESH_OTA_TYPE_ABORT:
-		if (pkt_len < sizeof(mesh_ota_abort_packet_t)) return ESP_ERR_INVALID_SIZE;
-		return handle_abort((const mesh_ota_abort_packet_t *)pkt_buf, pkt_len);
+		ret = (pkt_len < sizeof(mesh_ota_abort_packet_t))
+		      ? ESP_ERR_INVALID_SIZE
+		      : handle_abort((const mesh_ota_abort_packet_t *)pkt_buf, pkt_len);
+		break;
 	default:
-		return ESP_ERR_INVALID_ARG;
+		ret = ESP_ERR_INVALID_ARG;
+		break;
 	}
+
+	xSemaphoreGive(s_ota_lock);
+	return ret;
 }

@@ -13,6 +13,7 @@
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "freertos/task.h"
 
 #include "sdkconfig.h"
@@ -30,6 +31,7 @@ static bool		s_inited = false;
 static bool		s_stream_enabled = false;
 static bool		s_mesh_connected = false;
 static bool		s_in_hook = false;
+static portMUX_TYPE	s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static char		s_tag[16] = "node";
 
@@ -55,6 +57,29 @@ static uint32_t		s_last_tx_ok_ms = 0;
 	#define CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE 0
 #endif
 
+static uint32_t now_ms(void)
+{
+	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static bool stream_enabled_snapshot(void)
+{
+	bool enabled;
+	portENTER_CRITICAL(&s_state_lock);
+	enabled = s_stream_enabled;
+	portEXIT_CRITICAL(&s_state_lock);
+	return enabled;
+}
+
+static bool mesh_connected_snapshot(void)
+{
+	bool connected;
+	portENTER_CRITICAL(&s_state_lock);
+	connected = s_mesh_connected;
+	portEXIT_CRITICAL(&s_state_lock);
+	return connected;
+}
+
 static void build_time_prefix(char *out, size_t out_sz)
 {
 	if (!out || out_sz == 0) return;
@@ -77,15 +102,18 @@ static void build_time_prefix(char *out, size_t out_sz)
 
 static void record_send_result(esp_err_t err)
 {
+	uint32_t now = now_ms();
+	portENTER_CRITICAL(&s_state_lock);
 	s_last_send_err = err;
 	if (err == ESP_OK) {
-		s_last_tx_ok_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+		s_last_tx_ok_ms = now;
 	}
+	portEXIT_CRITICAL(&s_state_lock);
 }
 
 static esp_err_t send_nodeinfo_to_root(void)
 {
-	if (!s_mesh_connected) {
+	if (!mesh_connected_snapshot()) {
 		record_send_result(ESP_ERR_INVALID_STATE);
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -125,7 +153,7 @@ static esp_err_t send_nodeinfo_to_root(void)
 static void send_logline_to_root(const char *line)
 {
 	if (!line) return;
-	if (!s_mesh_connected) return;
+	if (!mesh_connected_snapshot()) return;
 
 #if CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE
 	if (mesh_v2_node_send_log_line(line) == ESP_OK) {
@@ -198,7 +226,9 @@ static void nodeinfo_burst_task(void *arg)
 		vTaskDelay(pdMS_TO_TICKS(350));
 	}
 
+	portENTER_CRITICAL(&s_state_lock);
 	s_nodeinfo_burst_task = NULL;
+	portEXIT_CRITICAL(&s_state_lock);
 	vTaskDelete(NULL);
 }
 
@@ -214,7 +244,7 @@ static int mesh_log_vprintf(const char *fmt, va_list ap)
 	}
 
 	// 2) Stop here when remote streaming is disabled.
-	if (!s_stream_enabled) return ret;
+	if (!stream_enabled_snapshot()) return ret;
 
 	// 3) Recursion guard.
 	if (s_in_hook) return ret;
@@ -297,16 +327,20 @@ void mesh_log_stream_init(const char *tag)
 
 void mesh_log_stream_on_mesh_connected(void)
 {
+	portENTER_CRITICAL(&s_state_lock);
 	s_mesh_connected = true;
+	portEXIT_CRITICAL(&s_state_lock);
 	(void)send_nodeinfo_to_root();
 	mesh_log_stream_kick_nodeinfo_burst();
 }
 
 void mesh_log_stream_on_mesh_disconnected(void)
 {
+	portENTER_CRITICAL(&s_state_lock);
 	s_mesh_connected = false;
 	s_stream_enabled = false;
 	s_last_tx_ok_ms = 0;
+	portEXIT_CRITICAL(&s_state_lock);
 }
 
 esp_err_t mesh_log_stream_send_nodeinfo_now(void)
@@ -316,28 +350,53 @@ esp_err_t mesh_log_stream_send_nodeinfo_now(void)
 
 void mesh_log_stream_kick_nodeinfo_burst(void)
 {
-	if (s_nodeinfo_burst_task || !s_mesh_connected) {
+	bool should_start = false;
+
+	portENTER_CRITICAL(&s_state_lock);
+	if (!s_nodeinfo_burst_task && s_mesh_connected) {
+		s_nodeinfo_burst_task = (TaskHandle_t)1;
+		should_start = true;
+	}
+	portEXIT_CRITICAL(&s_state_lock);
+
+	if (!should_start) {
 		return;
 	}
+
+	TaskHandle_t task = NULL;
 	if (xTaskCreate(nodeinfo_burst_task, "nodeinfo_burst", 3072, NULL, 4,
-	                &s_nodeinfo_burst_task) != pdPASS) {
+	                &task) == pdPASS) {
+		portENTER_CRITICAL(&s_state_lock);
+		s_nodeinfo_burst_task = task;
+		portEXIT_CRITICAL(&s_state_lock);
+	} else {
+		portENTER_CRITICAL(&s_state_lock);
 		s_nodeinfo_burst_task = NULL;
+		portEXIT_CRITICAL(&s_state_lock);
 		(void)send_nodeinfo_to_root();
 	}
 }
 
 esp_err_t mesh_log_stream_last_send_err(void)
 {
-	return s_last_send_err;
+	esp_err_t err;
+	portENTER_CRITICAL(&s_state_lock);
+	err = s_last_send_err;
+	portEXIT_CRITICAL(&s_state_lock);
+	return err;
 }
 
 uint32_t mesh_log_stream_root_ok_age_ms(void)
 {
-	if (s_last_tx_ok_ms == 0) {
+	uint32_t last_tx_ok_ms;
+	portENTER_CRITICAL(&s_state_lock);
+	last_tx_ok_ms = s_last_tx_ok_ms;
+	portEXIT_CRITICAL(&s_state_lock);
+
+	if (last_tx_ok_ms == 0) {
 		return UINT32_MAX;
 	}
-	uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-	return (uint32_t)(now - s_last_tx_ok_ms);
+	return (uint32_t)(now_ms() - last_tx_ok_ms);
 }
 
 bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms)
@@ -347,7 +406,7 @@ bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms)
 
 bool mesh_log_stream_enabled(void)
 {
-	return s_stream_enabled;
+	return stream_enabled_snapshot();
 }
 
 esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
@@ -366,7 +425,9 @@ esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len)
 	}
 
 	bool enable = (p->enable != 0);
+	portENTER_CRITICAL(&s_state_lock);
 	s_stream_enabled = enable;
+	portEXIT_CRITICAL(&s_state_lock);
 
 	if (enable) {
 		(void)send_nodeinfo_to_root();

@@ -15,7 +15,7 @@
 
 static const char *TAG = "mesh_time";
 
-// Має співпасти з твоїм mesh_packet_t
+// Must match the legacy mesh_packet_t wire layout.
 typedef struct __attribute__((packed)) {
 	uint8_t		magic;
 	uint8_t		version;
@@ -45,7 +45,7 @@ static bool			s_have_time = false;
 
 static void set_tz_pl(void)
 {
-	// Те саме правило, що ти вже юзаєш на node0
+	// Keep the same CET/CEST timezone rule used by the mesh nodes.
 	setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
 	tzset();
 }
@@ -118,9 +118,8 @@ static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 
 static void mesh_time_root_task(void *arg)
 {
-	// Перший "тик" робимо швидко, щоб після появи часу ноди не чекали 60с
+	// First tick is intentionally quick after time becomes valid.
 	TickType_t last = xTaskGetTickCount();
-	bool first_sent = false;
 
 	while (true) {
 
@@ -141,7 +140,6 @@ static void mesh_time_root_task(void *arg)
 			ESP_LOGW(TAG, "TIME TX err=%s seq=%" PRIu32, esp_err_to_name(err), s_seq);
 		}
 
-		first_sent = true;
 		last = xTaskGetTickCount();
 	}
 }
@@ -150,10 +148,17 @@ esp_err_t mesh_time_sync_root_start(uint32_t period_ms)
 {
 	//mesh_time_sync_init();
 
+	if (s_root_task_started) {
+		return ESP_OK;
+	}
+
+	mesh_time_sync_root_set_period_ms(period_ms);
+
 	if (xTaskCreate(mesh_time_root_task, "mesh_time_tx", 4096, NULL, 4, NULL) != pdPASS) {
 		return ESP_ERR_NO_MEM;
 	}
 
+	s_root_task_started = true;
 	ESP_LOGI(TAG, "TIME task started, period=%u ms", (unsigned)s_period_ms);
 	return ESP_OK;
 }
@@ -169,7 +174,7 @@ esp_err_t mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len)
 
 	const mesh_packet_wire_t *pkt = (const mesh_packet_wire_t *)pkt_buf;
 
-	// фільтр “це точно наш пакет”
+	// Filter: accept only our TIME packet.
 	if (pkt->magic != OUR_MAGIC || pkt->version != OUR_VER) {
 		return ESP_ERR_INVALID_ARG;
 	}
@@ -185,7 +190,7 @@ esp_err_t mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len)
 		return ESP_ERR_INVALID_RESPONSE;
 	}
 
-	// простий анти-rollback / анти-дублікат
+	// Simple anti-rollback / duplicate guard.
 	if (s_have_time && tp.seq != 0 && tp.seq <= s_last_rx_seq) {
 		return ESP_OK;
 	}

@@ -37,7 +37,6 @@
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
 #define ROOT_ACK_FRESH_MS       30000U
-#define ROOT_V1_FRESH_MS        30000U
 #define ROOT_RECOVERY_BURST_MS  5000U
 #define ROOT_RECOVERY_RESET_MS  15000U
 #define ROOT_RECOVERY_SOFT_MS   20000U
@@ -129,6 +128,32 @@ static int8_t current_parent_rssi(void)
 		return ap.rssi;
 	}
 	return -127;
+}
+
+static esp_err_t copy_mesh_config_string(uint8_t *dst, size_t dst_sz,
+                                         const char *src, size_t *out_len,
+                                         const char *label)
+{
+	if (!dst || dst_sz == 0 || !src) {
+		ESP_LOGE(MESH_TAG, "%s config string is invalid", label ? label : "mesh");
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	size_t len = strnlen(src, dst_sz + 1);
+	if (len > dst_sz) {
+		ESP_LOGE(MESH_TAG, "%s too long: %u > %u bytes",
+		         label ? label : "mesh",
+		         (unsigned)len,
+		         (unsigned)dst_sz);
+		return ESP_ERR_INVALID_SIZE;
+	}
+
+	memset(dst, 0, dst_sz);
+	memcpy(dst, src, len);
+	if (out_len) {
+		*out_len = len;
+	}
+	return ESP_OK;
 }
 
 static void update_v2_topology(bool send_now)
@@ -460,7 +485,6 @@ static void root_liveness_watchdog_step(void)
 
 	uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
 	root_recovery_phase_t phase = ROOT_RECOVERY_WAIT_ACK;
-	bool tx_recent = mesh_log_stream_root_ok_fresh(ROOT_V1_FRESH_MS);
 
 	if (down_ms >= ROOT_RECOVERY_HARD_MS) {
 		phase = ROOT_RECOVERY_MESH_RESTART;
@@ -471,24 +495,6 @@ static void root_liveness_watchdog_step(void)
 	}
 	s_root_recovery_phase = phase;
 	mesh_v2_node_set_recovery_phase((uint8_t)phase);
-
-	if (tx_recent && down_ms < ROOT_RECOVERY_SOFT_MS) {
-		if (s_last_root_burst_ms == 0 ||
-		    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
-			s_last_root_burst_ms = now;
-			bool reset_v2_session = down_ms >= ROOT_RECOVERY_RESET_MS;
-			(void)mesh_v2_node_force_hello(reset_v2_session);
-			update_v2_topology(false);
-			esp_err_t err = mesh_log_stream_send_nodeinfo_now();
-			(void)mesh_v2_node_send_topology();
-			root_recovery_log_throttled(now, down_ms, phase,
-			                            reset_v2_session
-			                            ? "hello_reset_nodeinfo_tx_wait_ack"
-			                            : "hello_nodeinfo_tx_wait_ack",
-			                            err);
-		}
-		return;
-	}
 
 	if (s_last_root_burst_ms == 0 ||
 	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
@@ -712,9 +718,20 @@ static void mesh_event_handler(void *arg,
 	case MESH_EVENT_NO_PARENT_FOUND: {
 		mesh_event_no_parent_found_t *np =
 		    (mesh_event_no_parent_found_t *)event_data;
+		uint32_t now = tick_ms();
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_NO_PARENT_FOUND> scan times:%d",
 		         np->scan_times);
+		note_mesh_disconnected();
+		mesh_v2_node_on_mesh_disconnected();
+		mesh_log_stream_on_mesh_disconnected();
+		if (now > MESH_RECONNECT_SOFT_MS) {
+			s_disconnected_since_ms = now - MESH_RECONNECT_SOFT_MS;
+		} else {
+			s_disconnected_since_ms = 1;
+		}
+		s_last_reconnect_attempt_ms = 0;
+		(void)esp_mesh_flush_scan_result();
 	}
 	break;
 
@@ -808,6 +825,27 @@ static void mesh_event_handler(void *arg,
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_NETWORK_STATE> is_rootless:%d",
 		         ns->is_rootless);
+		if (ns->is_rootless) {
+			uint32_t now = tick_ms();
+			if (s_root_unhealthy_since_ms == 0) {
+				s_root_unhealthy_since_ms = now;
+			}
+			s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
+			mesh_v2_node_set_recovery_phase((uint8_t)s_root_recovery_phase);
+			mesh_v2_node_on_mesh_disconnected();
+			s_last_root_burst_ms = 0;
+			if (is_mesh_connected) {
+				(void)mesh_v2_node_force_hello(true);
+				update_v2_topology(false);
+				(void)mesh_log_stream_send_nodeinfo_now();
+				mesh_log_stream_kick_nodeinfo_burst();
+			}
+			root_recovery_log_throttled(now,
+			                            (uint32_t)(now - s_root_unhealthy_since_ms),
+			                            s_root_recovery_phase,
+			                            "rootless_hello_nodeinfo",
+			                            mesh_log_stream_last_send_err());
+		}
 	}
 	break;
 
@@ -849,6 +887,7 @@ void app_main(void)
 	log_time_vprintf_start();
 	mesh_v2_node_init(MESH_TAG);
 	mesh_log_stream_init(MESH_TAG);
+	ESP_ERROR_CHECK(mesh_ota_receiver_start());
 
 	// This is a regular remote node. Only node0 fixes itself as MESH_ROOT.
 	ESP_ERROR_CHECK(esp_mesh_fix_root(false));
@@ -880,21 +919,28 @@ void app_main(void)
 
 	// Router-facing Wi-Fi credentials from menuconfig.
 	cfg.channel        = CONFIG_MESH_CHANNEL;
-	cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
-	memcpy(cfg.router.ssid,
-	       CONFIG_MESH_ROUTER_SSID,
-	       cfg.router.ssid_len);
-	memcpy(cfg.router.password,
-	       CONFIG_MESH_ROUTER_PASSWD,
-	       strlen(CONFIG_MESH_ROUTER_PASSWD));
+	size_t router_ssid_len = 0;
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.ssid,
+	                                        sizeof(cfg.router.ssid),
+	                                        CONFIG_MESH_ROUTER_SSID,
+	                                        &router_ssid_len,
+	                                        "router ssid"));
+	cfg.router.ssid_len = (uint8_t)router_ssid_len;
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.password,
+	                                        sizeof(cfg.router.password),
+	                                        CONFIG_MESH_ROUTER_PASSWD,
+	                                        NULL,
+	                                        "router password"));
 
 	// Mesh AP for child nodes.
 	ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
 	cfg.mesh_ap.max_connection        = CONFIG_MESH_AP_CONNECTIONS;
 	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
-	memcpy(cfg.mesh_ap.password,
-	       CONFIG_MESH_AP_PASSWD,
-	       strlen(CONFIG_MESH_AP_PASSWD));
+	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.mesh_ap.password,
+	                                        sizeof(cfg.mesh_ap.password),
+	                                        CONFIG_MESH_AP_PASSWD,
+	                                        NULL,
+	                                        "mesh ap password"));
 
 	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
 
