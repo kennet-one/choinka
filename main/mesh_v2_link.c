@@ -5,6 +5,7 @@
 
 #include "esp_log.h"
 #include "esp_mesh.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -65,6 +66,34 @@ static uint32_t s_tunnel_replay_count = 0;
 #ifndef MESH_V2_HELLO_RETRY_MS
 #define MESH_V2_HELLO_RETRY_MS 5000
 #endif
+
+static void fill_ota_slot_info(char running_label[MESH_OTA_SLOT_LABEL_MAX],
+                               char update_label[MESH_OTA_SLOT_LABEL_MAX],
+                               uint32_t *running_size,
+                               uint32_t *update_size)
+{
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+
+	if (running_label) {
+		memset(running_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+		if (running) {
+			strncpy(running_label, running->label, MESH_OTA_SLOT_LABEL_MAX - 1);
+		}
+	}
+	if (update_label) {
+		memset(update_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+		if (update) {
+			strncpy(update_label, update->label, MESH_OTA_SLOT_LABEL_MAX - 1);
+		}
+	}
+	if (running_size) {
+		*running_size = running ? (uint32_t)running->size : 0;
+	}
+	if (update_size) {
+		*update_size = update ? (uint32_t)update->size : 0;
+	}
+}
 
 static uint32_t ms_now(void)
 {
@@ -626,31 +655,37 @@ esp_err_t mesh_v2_node_send_log_line(const char *line)
 
 esp_err_t mesh_v2_node_send_topology(void)
 {
-	mesh_v2_topology_payload_t p;
+	mesh_v2_topology_v2_payload_t p;
 	memset(&p, 0, sizeof(p));
 
 	recover_root_link_if_needed();
 
 	portENTER_CRITICAL(&s_lock);
-	copy_tag(p.tag, sizeof(p.tag), s_tag);
-	mac_copy(p.parent_mac, s_parent_mac);
-	mac_copy(p.root_mac, s_root_mac);
-	p.layer = s_layer;
-	p.max_layer = s_max_layer;
-	p.parent_rssi = s_parent_rssi;
-	p.child_count = s_child_count;
-	p.gap_count = s_tunnel_gap_count;
-	p.lost_count = s_tunnel_lost_count;
-	p.replay_count = s_tunnel_replay_count;
-	p.recovery_phase = s_recovery_phase;
+	copy_tag(p.base.tag, sizeof(p.base.tag), s_tag);
+	mac_copy(p.base.parent_mac, s_parent_mac);
+	mac_copy(p.base.root_mac, s_root_mac);
+	p.base.layer = s_layer;
+	p.base.max_layer = s_max_layer;
+	p.base.parent_rssi = s_parent_rssi;
+	p.base.child_count = s_child_count;
+	p.base.gap_count = s_tunnel_gap_count;
+	p.base.lost_count = s_tunnel_lost_count;
+	p.base.replay_count = s_tunnel_replay_count;
+	p.base.recovery_phase = s_recovery_phase;
 	portEXIT_CRITICAL(&s_lock);
 
-	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-	p.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
-	p.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
-	p.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
-	p.last_send_err = (int32_t)mesh_log_stream_last_send_err();
-	p.log_stream_enabled = mesh_log_stream_enabled() ? 1 : 0;
+	p.base.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+	p.base.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
+	p.base.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
+	p.base.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
+	p.base.last_send_err = (int32_t)mesh_log_stream_last_send_err();
+	p.base.log_stream_enabled = mesh_log_stream_enabled() ? 1 : 0;
+	uint32_t running_size = 0;
+	uint32_t update_size = 0;
+	fill_ota_slot_info(p.ota_running_label, p.ota_update_label,
+	                   &running_size, &update_size);
+	p.ota_running_size = running_size;
+	p.ota_update_size = update_size;
 
 	return send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
 }

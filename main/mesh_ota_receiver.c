@@ -79,27 +79,61 @@ static void ota_rx_touch(void)
 	s_ota.last_rx_tick = xTaskGetTickCount();
 }
 
+static void fill_ota_slot_info(char running_label[MESH_OTA_SLOT_LABEL_MAX],
+                               char update_label[MESH_OTA_SLOT_LABEL_MAX],
+                               uint32_t *running_size,
+                               uint32_t *update_size)
+{
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
+
+	if (running_label) {
+		memset(running_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+		if (running) {
+			strncpy(running_label, running->label, MESH_OTA_SLOT_LABEL_MAX - 1);
+		}
+	}
+	if (update_label) {
+		memset(update_label, 0, MESH_OTA_SLOT_LABEL_MAX);
+		if (update) {
+			strncpy(update_label, update->label, MESH_OTA_SLOT_LABEL_MAX - 1);
+		}
+	}
+	if (running_size) {
+		*running_size = running ? (uint32_t)running->size : 0;
+	}
+	if (update_size) {
+		*update_size = update ? (uint32_t)update->size : 0;
+	}
+}
+
 static void send_status(uint8_t op, uint8_t code, uint16_t seq,
                         uint32_t offset, uint32_t total, const char *msg)
 {
-	mesh_ota_status_packet_t p;
+	mesh_ota_status_v2_packet_t p;
 	memset(&p, 0, sizeof(p));
 
-	p.h.magic = MESH_PKT_MAGIC;
-	p.h.version = MESH_PKT_VERSION;
-	p.h.type = MESH_OTA_TYPE_STATUS;
-	p.h.counter = ++s_status_counter;
-	esp_wifi_get_mac(WIFI_IF_STA, p.h.src_mac);
+	p.base.h.magic = MESH_PKT_MAGIC;
+	p.base.h.version = MESH_PKT_VERSION;
+	p.base.h.type = MESH_OTA_TYPE_STATUS;
+	p.base.h.counter = ++s_status_counter;
+	esp_wifi_get_mac(WIFI_IF_STA, p.base.h.src_mac);
 
-	p.op = op;
-	p.code = code;
-	p.seq = seq;
-	p.offset = offset;
-	p.total = total;
+	p.base.op = op;
+	p.base.code = code;
+	p.base.seq = seq;
+	p.base.offset = offset;
+	p.base.total = total;
 	if (msg) {
-		strncpy(p.message, msg, sizeof(p.message) - 1);
-		p.message[sizeof(p.message) - 1] = '\0';
+		strncpy(p.base.message, msg, sizeof(p.base.message) - 1);
+		p.base.message[sizeof(p.base.message) - 1] = '\0';
 	}
+	uint32_t running_size = 0;
+	uint32_t update_size = 0;
+	fill_ota_slot_info(p.running_label, p.update_label,
+	                   &running_size, &update_size);
+	p.running_size = running_size;
+	p.update_size = update_size;
 
 	mesh_data_t data;
 	memset(&data, 0, sizeof(data));
