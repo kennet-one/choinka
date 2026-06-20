@@ -582,6 +582,11 @@ void mesh_v2_node_kick_root(void)
 	recover_root_link_if_needed();
 }
 
+esp_err_t mesh_v2_node_force_hello(bool reset_session)
+{
+	return send_hello(reset_session);
+}
+
 esp_err_t mesh_v2_node_send_nodeinfo(void)
 {
 	mesh_v2_tunnel_nodeinfo_payload_t p;

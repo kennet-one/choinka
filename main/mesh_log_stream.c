@@ -37,7 +37,7 @@ static uint32_t		s_cnt = 0;
 static TaskHandle_t	s_nodeinfo_task = NULL;
 static TaskHandle_t	s_nodeinfo_burst_task = NULL;
 static esp_err_t	s_last_send_err = ESP_OK;
-static uint32_t		s_last_root_ok_ms = 0;
+static uint32_t		s_last_tx_ok_ms = 0;
 
 #ifndef LOG_STREAM_STACK_TMP
 	#define LOG_STREAM_STACK_TMP	128
@@ -79,7 +79,7 @@ static void record_send_result(esp_err_t err)
 {
 	s_last_send_err = err;
 	if (err == ESP_OK) {
-		s_last_root_ok_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+		s_last_tx_ok_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 	}
 }
 
@@ -306,7 +306,7 @@ void mesh_log_stream_on_mesh_disconnected(void)
 {
 	s_mesh_connected = false;
 	s_stream_enabled = false;
-	s_last_root_ok_ms = 0;
+	s_last_tx_ok_ms = 0;
 }
 
 esp_err_t mesh_log_stream_send_nodeinfo_now(void)
@@ -333,11 +333,11 @@ esp_err_t mesh_log_stream_last_send_err(void)
 
 uint32_t mesh_log_stream_root_ok_age_ms(void)
 {
-	if (s_last_root_ok_ms == 0) {
+	if (s_last_tx_ok_ms == 0) {
 		return UINT32_MAX;
 	}
 	uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-	return (uint32_t)(now - s_last_root_ok_ms);
+	return (uint32_t)(now - s_last_tx_ok_ms);
 }
 
 bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms)
