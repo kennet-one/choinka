@@ -21,6 +21,22 @@ void mesh_v2_node_update_topology(const uint8_t parent_mac[6],
                                   int8_t parent_rssi,
                                   uint8_t child_count);
 
+typedef struct {
+	uint32_t boot_seq;
+	uint32_t last_recovery_action_ms;
+	int32_t last_mesh_send_err;
+	uint16_t reset_reason;
+	uint16_t parent_disconnect_count;
+	uint16_t no_parent_count;
+	uint16_t rootless_count;
+	uint16_t soft_reconnect_count;
+	uint16_t mesh_restart_count;
+	uint16_t diag_flags;
+	uint8_t last_parent_disconnect_reason;
+} mesh_v2_node_diag_t;
+
+void mesh_v2_node_update_diagnostics(const mesh_v2_node_diag_t *diag);
+
 bool mesh_v2_node_ready(void);
 bool mesh_v2_node_ack_fresh(uint32_t max_age_ms);
 uint32_t mesh_v2_node_ack_age_ms(void);

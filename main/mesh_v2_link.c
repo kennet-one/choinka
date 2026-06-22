@@ -58,6 +58,7 @@ static uint8_t s_recovery_phase = 0;
 static uint32_t s_tunnel_gap_count = 0;
 static uint32_t s_tunnel_lost_count = 0;
 static uint32_t s_tunnel_replay_count = 0;
+static mesh_v2_node_diag_t s_diag = {0};
 
 #ifndef MESH_V2_ACK_STALE_MS
 #define MESH_V2_ACK_STALE_MS 30000
@@ -560,6 +561,17 @@ void mesh_v2_node_update_topology(const uint8_t parent_mac[6],
 	portEXIT_CRITICAL(&s_lock);
 }
 
+void mesh_v2_node_update_diagnostics(const mesh_v2_node_diag_t *diag)
+{
+	if (!diag) {
+		return;
+	}
+
+	portENTER_CRITICAL(&s_lock);
+	s_diag = *diag;
+	portEXIT_CRITICAL(&s_lock);
+}
+
 bool mesh_v2_node_ready(void)
 {
 	bool ready;
@@ -655,39 +667,59 @@ esp_err_t mesh_v2_node_send_log_line(const char *line)
 
 esp_err_t mesh_v2_node_send_topology(void)
 {
-	mesh_v2_topology_v2_payload_t p;
+	mesh_v2_topology_v3_payload_t p;
 	memset(&p, 0, sizeof(p));
+	mesh_v2_node_diag_t diag;
 
 	recover_root_link_if_needed();
 
 	portENTER_CRITICAL(&s_lock);
-	copy_tag(p.base.tag, sizeof(p.base.tag), s_tag);
-	mac_copy(p.base.parent_mac, s_parent_mac);
-	mac_copy(p.base.root_mac, s_root_mac);
-	p.base.layer = s_layer;
-	p.base.max_layer = s_max_layer;
-	p.base.parent_rssi = s_parent_rssi;
-	p.base.child_count = s_child_count;
-	p.base.gap_count = s_tunnel_gap_count;
-	p.base.lost_count = s_tunnel_lost_count;
-	p.base.replay_count = s_tunnel_replay_count;
-	p.base.recovery_phase = s_recovery_phase;
+	copy_tag(p.v2.base.tag, sizeof(p.v2.base.tag), s_tag);
+	mac_copy(p.v2.base.parent_mac, s_parent_mac);
+	mac_copy(p.v2.base.root_mac, s_root_mac);
+	p.v2.base.layer = s_layer;
+	p.v2.base.max_layer = s_max_layer;
+	p.v2.base.parent_rssi = s_parent_rssi;
+	p.v2.base.child_count = s_child_count;
+	p.v2.base.gap_count = s_tunnel_gap_count;
+	p.v2.base.lost_count = s_tunnel_lost_count;
+	p.v2.base.replay_count = s_tunnel_replay_count;
+	p.v2.base.recovery_phase = s_recovery_phase;
+	diag = s_diag;
 	portEXIT_CRITICAL(&s_lock);
 
-	p.base.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-	p.base.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
-	p.base.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
-	p.base.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
-	p.base.last_send_err = (int32_t)mesh_log_stream_last_send_err();
-	p.base.log_stream_enabled = mesh_log_stream_enabled() ? 1 : 0;
+	p.v2.base.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+	p.v2.base.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY | MESH_V2_CAP_TOPOLOGY;
+	p.v2.base.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
+	p.v2.base.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
+	p.v2.base.last_send_err = diag.last_mesh_send_err;
+	p.v2.base.log_stream_enabled = mesh_log_stream_enabled() ? 1 : 0;
+	p.v2.base.diag_flags = MESH_V2_TOPO_DIAG_HAS_EXT | diag.diag_flags;
+	if (p.v2.base.uptime_s < 300U) {
+		p.v2.base.diag_flags |= MESH_V2_TOPO_DIAG_RECENT_REBOOT;
+	}
 	uint32_t running_size = 0;
 	uint32_t update_size = 0;
-	fill_ota_slot_info(p.ota_running_label, p.ota_update_label,
+	fill_ota_slot_info(p.v2.ota_running_label, p.v2.ota_update_label,
 	                   &running_size, &update_size);
-	p.ota_running_size = running_size;
-	p.ota_update_size = update_size;
+	p.v2.ota_running_size = running_size;
+	p.v2.ota_update_size = update_size;
+	p.boot_seq = diag.boot_seq;
+	p.last_recovery_action_ms = diag.last_recovery_action_ms;
+	p.last_mesh_send_err = diag.last_mesh_send_err;
+	p.reset_reason = diag.reset_reason;
+	p.parent_disconnect_count = diag.parent_disconnect_count;
+	p.no_parent_count = diag.no_parent_count;
+	p.rootless_count = diag.rootless_count;
+	p.soft_reconnect_count = diag.soft_reconnect_count;
+	p.mesh_restart_count = diag.mesh_restart_count;
+	p.last_parent_disconnect_reason = diag.last_parent_disconnect_reason;
 
-	return send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
+	esp_err_t err = send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
+	portENTER_CRITICAL(&s_lock);
+	s_diag.last_mesh_send_err = (int32_t)err;
+	portEXIT_CRITICAL(&s_lock);
+	return err;
 }
 
 static esp_err_t mesh_v2_node_send_task_snapshot(uint32_t request_id)

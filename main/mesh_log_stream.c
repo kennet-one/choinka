@@ -320,7 +320,7 @@ void mesh_log_stream_init(const char *tag)
 
 	s_prev_vprintf = (vprintf_like_t)esp_log_set_vprintf(&mesh_log_vprintf);
 	if (!s_nodeinfo_task) {
-		xTaskCreate(nodeinfo_heartbeat_task, "nodeinfo_hb", 3072, NULL, 4, &s_nodeinfo_task);
+		xTaskCreate(nodeinfo_heartbeat_task, "nodeinfo_hb", 4096, NULL, 4, &s_nodeinfo_task);
 	}
 	ESP_LOGI(TAG, "mesh log stream inited (waiting CTRL)");
 }
@@ -364,7 +364,7 @@ void mesh_log_stream_kick_nodeinfo_burst(void)
 	}
 
 	TaskHandle_t task = NULL;
-	if (xTaskCreate(nodeinfo_burst_task, "nodeinfo_burst", 3072, NULL, 4,
+	if (xTaskCreate(nodeinfo_burst_task, "nodeinfo_burst", 4096, NULL, 4,
 	                &task) == pdPASS) {
 		portENTER_CRITICAL(&s_state_lock);
 		s_nodeinfo_burst_task = task;

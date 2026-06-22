@@ -13,7 +13,7 @@
 #include "nvs.h"
 
 #define STACK_MONITOR_MAX_TASKS	25
-#define STACK_MONITOR_PERIOD_MS	60000	// раз на 60 секунд
+#define STACK_MONITOR_PERIOD_MS	60000	// Once per 60 seconds.
 
 static const char *TAG = "[STACKMON]";
 
@@ -75,12 +75,12 @@ static void log_flash_snapshot(void)
 			(unsigned)nvs_total);
 }
 
-// Основна таска моніторингу
+// Main monitoring task.
 static void stack_monitor_task(void *arg)
 {
 	(void)arg;
 
-	// Попередній знімок
+	// Previous snapshot.
 	static TaskStatus_t	prev[STACK_MONITOR_MAX_TASKS];
 	static UBaseType_t	prev_count   = 0;
 	static bool			have_prev    = false;
@@ -90,7 +90,7 @@ static void stack_monitor_task(void *arg)
 		UBaseType_t		count       = 0;
 		uint32_t		total_time  = 0;
 
-		// Знімаємо стан усіх тасок
+		// Capture all task states.
 		count = uxTaskGetSystemState(cur,
 				STACK_MONITOR_MAX_TASKS,
 				&total_time);
@@ -100,8 +100,7 @@ static void stack_monitor_task(void *arg)
 				(unsigned)STACK_MONITOR_MAX_TASKS);
 
 		if (!have_prev) {
-			// Перший прохід – ще нема попереднього снапшота,
-			// показуємо тільки стек, CPU ставимо "?"
+			// First pass has no previous snapshot, so CPU is unknown.
 			for (UBaseType_t i = 0; i < count; ++i) {
 				const char *name = cur[i].pcTaskName;
 				if (!name || !name[0]) {
@@ -123,18 +122,17 @@ static void stack_monitor_task(void *arg)
 			prev_count = count;
 			have_prev  = true;
 		} else {
-			// Другий і далі проходи – рахуємо дельти ulRunTimeCounter
-
+			// Later passes use ulRunTimeCounter deltas.
 			uint64_t dt_total = 0;
 			uint64_t dt_idle  = 0;
 			uint32_t dt_arr[STACK_MONITOR_MAX_TASKS] = {0};
 
-			// Перший прохід: рахуємо dt для кожної таски і сумарний dt_total
+			// First pass: calculate per-task and total runtime deltas.
 			for (UBaseType_t i = 0; i < count; ++i) {
 				TaskStatus_t *c = &cur[i];
 				uint32_t prev_run = 0;
 
-				// шукаємо відповідну таску в попередньому знімку по xTaskNumber
+				// Match this task in the previous snapshot by xTaskNumber.
 				for (UBaseType_t j = 0; j < prev_count; ++j) {
 					if (prev[j].xTaskNumber == c->xTaskNumber) {
 						prev_run = prev[j].ulRunTimeCounter;
@@ -152,7 +150,7 @@ static void stack_monitor_task(void *arg)
 				}
 			}
 
-			// Другий прохід: друкуємо стек + відсоток CPU для кожної таски
+			// Second pass: print stack and CPU percentage for each task.
 			for (UBaseType_t i = 0; i < count; ++i) {
 				TaskStatus_t *c = &cur[i];
 				const char *name = c->pcTaskName;
@@ -173,12 +171,12 @@ static void stack_monitor_task(void *arg)
 						(unsigned)free_words,
 						cpu_pct);
 
-				// оновлюємо prev
+				// Update previous snapshot.
 				prev[i] = cur[i];
 			}
 			prev_count = count;
 
-			// Підсумкове CPU навантаження (без idle)
+			// Total CPU load excluding idle tasks.
 			float cpu_load = 0.0f;
 			if (dt_total > 0) {
 				cpu_load = (float)(dt_total - dt_idle) * 100.0f / (float)dt_total;
@@ -197,7 +195,7 @@ static void stack_monitor_task(void *arg)
 	}
 }
 
-// Публічний старт монітора
+// Public monitor start.
 void stack_monitor_start(UBaseType_t priority)
 {
 	static bool started = false;
@@ -210,7 +208,7 @@ void stack_monitor_start(UBaseType_t priority)
 	BaseType_t ok = xTaskCreate(
 			stack_monitor_task,
 			"stack_mon",
-			6096,			// стек монітора
+			6096,			// Monitor stack.
 			NULL,
 			priority,
 			NULL);

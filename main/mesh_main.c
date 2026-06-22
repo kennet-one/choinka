@@ -15,6 +15,7 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 
 #include "legacy_proto.h"
@@ -45,6 +46,7 @@
 #define MANUAL_REBOOT_DELAY_MIN_MS 500U
 #define MANUAL_REBOOT_DELAY_MAX_MS 5000U
 #define MANUAL_REBOOT_DELAY_DEFAULT_MS 1200U
+#define DIAG_RTC_MAGIC          0x43484f31U
 
 #ifndef CONFIG_CHOINKA_DIRECT_ROOT_ONLY
 #define CONFIG_CHOINKA_DIRECT_ROOT_ONLY 0
@@ -89,6 +91,23 @@ static uint32_t s_last_root_recovery_log_ms = 0;
 static bool s_manual_reboot_pending = false;
 static uint16_t s_manual_reboot_delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
 
+typedef struct {
+	uint32_t magic;
+	uint32_t boot_seq;
+} diag_rtc_state_t;
+
+static RTC_NOINIT_ATTR diag_rtc_state_t s_diag_rtc;
+static uint32_t s_boot_seq = 0;
+static uint16_t s_reset_reason = 0;
+static uint32_t s_parent_disconnect_count = 0;
+static uint32_t s_no_parent_count = 0;
+static uint32_t s_rootless_count = 0;
+static uint32_t s_soft_reconnect_count = 0;
+static uint32_t s_mesh_restart_count = 0;
+static uint8_t s_last_parent_disconnect_reason = 0;
+static int32_t s_last_mesh_send_err = ESP_OK;
+static uint32_t s_last_recovery_action_ms = 0;
+
 /* -------------------------------------------------------------------------- */
 /*  Minimal local protocol                                                    */
 /* -------------------------------------------------------------------------- */
@@ -119,6 +138,72 @@ static esp_err_t mesh_comm_start(void);
 static uint32_t tick_ms(void)
 {
 	return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static uint16_t diag_sat_u16(uint32_t v)
+{
+	return v > UINT16_MAX ? UINT16_MAX : (uint16_t)v;
+}
+
+static void diag_boot_init(void)
+{
+	if (s_diag_rtc.magic != DIAG_RTC_MAGIC) {
+		s_diag_rtc.magic = DIAG_RTC_MAGIC;
+		s_diag_rtc.boot_seq = 0;
+	}
+	s_diag_rtc.boot_seq++;
+	s_boot_seq = s_diag_rtc.boot_seq;
+	s_reset_reason = (uint16_t)esp_reset_reason();
+	ESP_LOGI(MESH_TAG, "boot diag: seq=%lu reset_reason=%u",
+	         (unsigned long)s_boot_seq,
+	         (unsigned)s_reset_reason);
+}
+
+static void diag_note_send_err(esp_err_t err)
+{
+	s_last_mesh_send_err = (int32_t)err;
+}
+
+static void diag_note_recovery_action(uint32_t now, esp_err_t err)
+{
+	s_last_recovery_action_ms = now;
+	diag_note_send_err(err);
+}
+
+static bool root_composite_health_fresh(void)
+{
+	if (mesh_v2_node_ack_fresh(ROOT_ACK_FRESH_MS)) {
+		return true;
+	}
+	if (mesh_log_stream_last_send_err() == ESP_OK &&
+	    mesh_log_stream_root_ok_fresh(ROOT_ACK_FRESH_MS)) {
+		return true;
+	}
+	return false;
+}
+
+static void sync_v2_diagnostics(void)
+{
+	mesh_v2_node_diag_t diag = {
+		.boot_seq = s_boot_seq,
+		.last_recovery_action_ms = s_last_recovery_action_ms,
+		.last_mesh_send_err = s_last_mesh_send_err,
+		.reset_reason = s_reset_reason,
+		.parent_disconnect_count = diag_sat_u16(s_parent_disconnect_count),
+		.no_parent_count = diag_sat_u16(s_no_parent_count),
+		.rootless_count = diag_sat_u16(s_rootless_count),
+		.soft_reconnect_count = diag_sat_u16(s_soft_reconnect_count),
+		.mesh_restart_count = diag_sat_u16(s_mesh_restart_count),
+		.diag_flags = root_composite_health_fresh()
+			? MESH_V2_TOPO_DIAG_COMPOSITE_HEALTH
+			: 0,
+		.last_parent_disconnect_reason = s_last_parent_disconnect_reason,
+	};
+	esp_err_t log_err = mesh_log_stream_last_send_err();
+	if (log_err != ESP_OK) {
+		diag.last_mesh_send_err = (int32_t)log_err;
+	}
+	mesh_v2_node_update_diagnostics(&diag);
 }
 
 static int8_t current_parent_rssi(void)
@@ -158,6 +243,7 @@ static esp_err_t copy_mesh_config_string(uint8_t *dst, size_t dst_sz,
 
 static void update_v2_topology(bool send_now)
 {
+	sync_v2_diagnostics();
 	mesh_v2_node_update_topology(mesh_parent_addr.addr,
 	                             mesh_root_addr,
 	                             (mesh_layer > 0) ? (uint16_t)mesh_layer : 0,
@@ -165,7 +251,8 @@ static void update_v2_topology(bool send_now)
 	                             current_parent_rssi(),
 	                             mesh_child_count);
 	if (send_now && is_mesh_connected) {
-		(void)mesh_v2_node_send_topology();
+		esp_err_t err = mesh_v2_node_send_topology();
+		diag_note_send_err(err);
 	}
 }
 
@@ -209,19 +296,26 @@ static const char *root_recovery_phase_name(root_recovery_phase_t phase)
 
 static void root_recovery_reset_ok(uint32_t now)
 {
+	bool was_recovering = s_root_recovery_phase != ROOT_RECOVERY_OK ||
+	                      s_root_unhealthy_since_ms != 0;
 	if (s_root_recovery_phase != ROOT_RECOVERY_OK && s_root_unhealthy_since_ms != 0) {
 		uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
 		ESP_LOGI(MESH_TAG,
-		         "root recovery: restored after %lu ms, ack_age=%lu",
+		         "root recovery: restored after %lu ms, ack_age=%lu tx_age=%lu",
 		         (unsigned long)down_ms,
-		         (unsigned long)mesh_v2_node_ack_age_ms());
+		         (unsigned long)mesh_v2_node_ack_age_ms(),
+		         (unsigned long)mesh_log_stream_root_ok_age_ms());
 	}
 	s_root_recovery_phase = ROOT_RECOVERY_OK;
+	mesh_v2_node_set_recovery_phase((uint8_t)ROOT_RECOVERY_OK);
 	s_root_unhealthy_since_ms = 0;
 	s_last_root_burst_ms = 0;
 	s_last_root_soft_reconnect_ms = 0;
 	s_last_root_hard_restart_ms = 0;
 	s_last_root_recovery_log_ms = 0;
+	if (was_recovering && is_mesh_connected) {
+		update_v2_topology(true);
+	}
 }
 
 static void root_recovery_log_throttled(uint32_t now, uint32_t down_ms,
@@ -461,7 +555,7 @@ static esp_err_t mesh_comm_start(void)
 	if (!started) {
 		started = true;
 		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
-        stack_monitor_start(3);
+		stack_monitor_start(3);
 	}
 	return ESP_OK;
 }
@@ -474,7 +568,7 @@ static void root_liveness_watchdog_step(void)
 		return;
 	}
 
-	if (mesh_v2_node_ack_fresh(ROOT_ACK_FRESH_MS)) {
+	if (root_composite_health_fresh()) {
 		root_recovery_reset_ok(now);
 		return;
 	}
@@ -500,21 +594,29 @@ static void root_liveness_watchdog_step(void)
 	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
 		s_last_root_burst_ms = now;
 		bool reset_v2_session = down_ms >= ROOT_RECOVERY_RESET_MS;
-		(void)mesh_v2_node_force_hello(reset_v2_session);
+		esp_err_t hello_err = mesh_v2_node_force_hello(reset_v2_session);
+		diag_note_send_err(hello_err);
 		update_v2_topology(false);
 		esp_err_t err = mesh_log_stream_send_nodeinfo_now();
-		(void)mesh_v2_node_send_topology();
+		diag_note_send_err(err);
+		sync_v2_diagnostics();
+		esp_err_t topo_err = mesh_v2_node_send_topology();
+		diag_note_send_err(topo_err);
 		root_recovery_log_throttled(now, down_ms, phase,
 		                            reset_v2_session
 		                            ? "hello_reset_nodeinfo_burst"
 		                            : "nodeinfo_burst",
-		                            err);
+		                            hello_err != ESP_OK ? hello_err :
+		                            err != ESP_OK ? err : topo_err);
 	}
 
 	if (down_ms >= ROOT_RECOVERY_HARD_MS &&
 	    (s_last_root_hard_restart_ms == 0 ||
 	     (uint32_t)(now - s_last_root_hard_restart_ms) >= ROOT_RECOVERY_HARD_MS)) {
 		s_last_root_hard_restart_ms = now;
+		s_mesh_restart_count++;
+		diag_note_recovery_action(now, ESP_OK);
+		sync_v2_diagnostics();
 		root_recovery_log_throttled(now, down_ms, ROOT_RECOVERY_MESH_RESTART,
 		                            "mesh_stop_start",
 		                            mesh_log_stream_last_send_err());
@@ -522,6 +624,7 @@ static void root_liveness_watchdog_step(void)
 		mesh_log_stream_on_mesh_disconnected();
 
 		esp_err_t stop_err = esp_mesh_stop();
+		diag_note_send_err(stop_err);
 		if (stop_err != ESP_OK) {
 			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_stop failed: %s",
 			         esp_err_to_name(stop_err));
@@ -530,6 +633,7 @@ static void root_liveness_watchdog_step(void)
 		note_mesh_disconnected();
 		(void)esp_mesh_flush_scan_result();
 		esp_err_t start_err = esp_mesh_start();
+		diag_note_send_err(start_err);
 		if (start_err != ESP_OK) {
 			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_start failed: %s",
 			         esp_err_to_name(start_err));
@@ -541,10 +645,14 @@ static void root_liveness_watchdog_step(void)
 	    (s_last_root_soft_reconnect_ms == 0 ||
 	     (uint32_t)(now - s_last_root_soft_reconnect_ms) >= ROOT_RECOVERY_SOFT_MS)) {
 		s_last_root_soft_reconnect_ms = now;
+		s_soft_reconnect_count++;
+		diag_note_recovery_action(now, ESP_OK);
+		sync_v2_diagnostics();
 		root_recovery_log_throttled(now, down_ms, ROOT_RECOVERY_MESH_RECONNECT,
 		                            "mesh_disconnect_connect",
 		                            mesh_log_stream_last_send_err());
 		esp_err_t disc_err = esp_mesh_disconnect();
+		diag_note_send_err(disc_err);
 		if (disc_err != ESP_OK) {
 			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_disconnect failed: %s",
 			         esp_err_to_name(disc_err));
@@ -555,6 +663,7 @@ static void root_liveness_watchdog_step(void)
 		vTaskDelay(pdMS_TO_TICKS(250));
 		(void)esp_mesh_flush_scan_result();
 		esp_err_t conn_err = esp_mesh_connect();
+		diag_note_send_err(conn_err);
 		if (conn_err != ESP_OK) {
 			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_connect failed: %s",
 			         esp_err_to_name(conn_err));
@@ -585,16 +694,20 @@ static void mesh_reconnect_watchdog_task(void *arg)
 		if (down_ms >= MESH_RECONNECT_SOFT_MS &&
 		    (uint32_t)(now - s_last_reconnect_attempt_ms) >= MESH_RECONNECT_SOFT_MS) {
 			s_last_reconnect_attempt_ms = now;
+			s_soft_reconnect_count++;
+			diag_note_recovery_action(now, ESP_OK);
 			ESP_LOGW(MESH_TAG,
 			         "mesh reconnect watchdog: no parent for %lu ms, calling esp_mesh_connect()",
 			         (unsigned long)down_ms);
 			esp_err_t flush_err = esp_mesh_flush_scan_result();
+			diag_note_send_err(flush_err);
 			if (flush_err != ESP_OK) {
 				ESP_LOGW(MESH_TAG,
 				         "mesh reconnect watchdog: scan flush failed: %s",
 				         esp_err_to_name(flush_err));
 			}
 			esp_err_t err = esp_mesh_connect();
+			diag_note_send_err(err);
 			if (err != ESP_OK) {
 				ESP_LOGW(MESH_TAG,
 				         "mesh reconnect watchdog: esp_mesh_connect failed: %s",
@@ -606,6 +719,8 @@ static void mesh_reconnect_watchdog_task(void *arg)
 		    (uint32_t)(now - s_last_mesh_restart_ms) >= MESH_RECONNECT_HARD_MS) {
 			s_last_mesh_restart_ms = now;
 			s_last_reconnect_attempt_ms = now;
+			s_mesh_restart_count++;
+			diag_note_recovery_action(now, ESP_OK);
 			ESP_LOGW(MESH_TAG,
 			         "mesh reconnect watchdog: no parent for %lu ms, restarting mesh service",
 			         (unsigned long)down_ms);
@@ -614,6 +729,7 @@ static void mesh_reconnect_watchdog_task(void *arg)
 			mesh_log_stream_on_mesh_disconnected();
 
 			esp_err_t stop_err = esp_mesh_stop();
+			diag_note_send_err(stop_err);
 			if (stop_err != ESP_OK) {
 				ESP_LOGW(MESH_TAG,
 				         "mesh reconnect watchdog: esp_mesh_stop failed: %s",
@@ -623,6 +739,7 @@ static void mesh_reconnect_watchdog_task(void *arg)
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			note_mesh_disconnected();
 			esp_err_t flush_err = esp_mesh_flush_scan_result();
+			diag_note_send_err(flush_err);
 			if (flush_err != ESP_OK) {
 				ESP_LOGW(MESH_TAG,
 				         "mesh reconnect watchdog: scan flush before restart failed: %s",
@@ -630,6 +747,7 @@ static void mesh_reconnect_watchdog_task(void *arg)
 			}
 
 			esp_err_t start_err = esp_mesh_start();
+			diag_note_send_err(start_err);
 			if (start_err != ESP_OK) {
 				ESP_LOGW(MESH_TAG,
 				         "mesh reconnect watchdog: esp_mesh_start failed: %s",
@@ -719,6 +837,7 @@ static void mesh_event_handler(void *arg,
 		mesh_event_no_parent_found_t *np =
 		    (mesh_event_no_parent_found_t *)event_data;
 		uint32_t now = tick_ms();
+		s_no_parent_count++;
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_NO_PARENT_FOUND> scan times:%d",
 		         np->scan_times);
@@ -769,6 +888,8 @@ static void mesh_event_handler(void *arg,
 	case MESH_EVENT_PARENT_DISCONNECTED: {
 		mesh_event_disconnected_t *disc =
 		    (mesh_event_disconnected_t *)event_data;
+		s_parent_disconnect_count++;
+		s_last_parent_disconnect_reason = disc->reason;
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_PARENT_DISCONNECTED> reason:%d",
 		         disc->reason);
@@ -827,6 +948,7 @@ static void mesh_event_handler(void *arg,
 		         ns->is_rootless);
 		if (ns->is_rootless) {
 			uint32_t now = tick_ms();
+			s_rootless_count++;
 			if (s_root_unhealthy_since_ms == 0) {
 				s_root_unhealthy_since_ms = now;
 			}
@@ -864,6 +986,7 @@ static void mesh_event_handler(void *arg,
 void app_main(void)
 {
 	ESP_ERROR_CHECK(nvs_flash_init());
+	diag_boot_init();
 	ota_mark_running_app_valid_if_pending();
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -948,7 +1071,7 @@ void app_main(void)
 	if (!s_mesh_reconnect_task) {
 		xTaskCreate(mesh_reconnect_watchdog_task,
 		            "mesh_reconn",
-		            4096,
+		            5120,
 		            NULL,
 		            4,
 		            &s_mesh_reconnect_task);
