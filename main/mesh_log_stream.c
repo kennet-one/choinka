@@ -404,6 +404,13 @@ bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms)
 	return mesh_log_stream_root_ok_age_ms() <= max_age_ms;
 }
 
+void mesh_log_stream_clear_root_ok(void)
+{
+	portENTER_CRITICAL(&s_state_lock);
+	s_last_tx_ok_ms = 0;
+	portEXIT_CRITICAL(&s_state_lock);
+}
+
 bool mesh_log_stream_enabled(void)
 {
 	return stream_enabled_snapshot();

@@ -25,6 +25,8 @@ typedef struct {
 	uint32_t boot_seq;
 	uint32_t last_recovery_action_ms;
 	int32_t last_mesh_send_err;
+	uint32_t ack_stale_count;
+	uint32_t tx_without_ack_count;
 	uint16_t reset_reason;
 	uint16_t parent_disconnect_count;
 	uint16_t no_parent_count;
@@ -33,6 +35,7 @@ typedef struct {
 	uint16_t mesh_restart_count;
 	uint16_t diag_flags;
 	uint8_t last_parent_disconnect_reason;
+	uint8_t last_recovery_reason;
 } mesh_v2_node_diag_t;
 
 void mesh_v2_node_update_diagnostics(const mesh_v2_node_diag_t *diag);

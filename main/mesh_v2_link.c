@@ -707,6 +707,8 @@ esp_err_t mesh_v2_node_send_topology(void)
 	p.boot_seq = diag.boot_seq;
 	p.last_recovery_action_ms = diag.last_recovery_action_ms;
 	p.last_mesh_send_err = diag.last_mesh_send_err;
+	p.ack_stale_count = diag.ack_stale_count;
+	p.tx_without_ack_count = diag.tx_without_ack_count;
 	p.reset_reason = diag.reset_reason;
 	p.parent_disconnect_count = diag.parent_disconnect_count;
 	p.no_parent_count = diag.no_parent_count;
@@ -714,6 +716,7 @@ esp_err_t mesh_v2_node_send_topology(void)
 	p.soft_reconnect_count = diag.soft_reconnect_count;
 	p.mesh_restart_count = diag.mesh_restart_count;
 	p.last_parent_disconnect_reason = diag.last_parent_disconnect_reason;
+	p.last_recovery_reason = diag.last_recovery_reason;
 
 	esp_err_t err = send_tunnel_packet(MESH_V2_TUNNEL_CHANNEL_TOPOLOGY, &p, sizeof(p), true);
 	portENTER_CRITICAL(&s_lock);

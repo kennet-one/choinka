@@ -23,6 +23,7 @@ esp_err_t mesh_log_stream_last_send_err(void);
 /* Legacy name: this is local TX-accepted age, not proof that root received it. */
 uint32_t mesh_log_stream_root_ok_age_ms(void);
 bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms);
+void mesh_log_stream_clear_root_ok(void);
 bool mesh_log_stream_enabled(void);
 
 // Call from mesh_rx_task() when MESH_LOG_TYPE_CTRL is received.
