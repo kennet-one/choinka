@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
 #include "nvs.h"
+#include "sdkconfig.h"
 
 #define STACK_MONITOR_MAX_TASKS	25
 #define STACK_MONITOR_PERIOD_MS	60000	// Once per 60 seconds.
@@ -22,12 +23,32 @@ static void log_ram_snapshot(void)
 	size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_8BIT);
 	size_t min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
 	size_t total_bytes = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+	size_t internal_free_bytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t internal_min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t internal_total_bytes = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t psram_free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	size_t psram_min_free_bytes = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	size_t psram_total_bytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	unsigned psram_enabled = psram_total_bytes > 0 ? 1U : 0U;
 
 	ESP_LOGI(TAG,
 			"RAM: free=%u min=%u total=%u bytes",
 			(unsigned)free_bytes,
 			(unsigned)min_free_bytes,
 			(unsigned)total_bytes);
+	ESP_LOGI(TAG,
+			"RAMX: hf=%u hm=%u ht=%u if=%u im=%u it=%u pe=%u pf=%u pm=%u pt=%u pc=%u",
+			(unsigned)free_bytes,
+			(unsigned)min_free_bytes,
+			(unsigned)total_bytes,
+			(unsigned)internal_free_bytes,
+			(unsigned)internal_min_free_bytes,
+			(unsigned)internal_total_bytes,
+			psram_enabled,
+			(unsigned)psram_free_bytes,
+			(unsigned)psram_min_free_bytes,
+			(unsigned)psram_total_bytes,
+			(unsigned)CONFIG_CHOINKA_PSRAM_EXPECTED_BYTES);
 }
 
 static void log_flash_snapshot(void)

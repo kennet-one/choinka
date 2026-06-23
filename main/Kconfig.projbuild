@@ -122,6 +122,15 @@ menu "Example Configuration"
             TOPOLOGY still use V2, while remote log lines use the older V1
             stream path so log traffic cannot destabilize V2 recovery.
 
+    config CHOINKA_PSRAM_EXPECTED_BYTES
+        int "Expected PSRAM capacity in bytes"
+        range 0 33554432
+        default 0
+        help
+            Optional board note for diagnostics when runtime PSRAM is inactive
+            or not detected. If PSRAM is detected and initialized, telemetry
+            uses the measured PSRAM heap size instead.
+
     config MESH_CHANNEL
         int "channel"
         range 0 14
