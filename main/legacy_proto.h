@@ -12,6 +12,7 @@ extern "C" {
  *  "readtds", "TDSB123", "pm1", "pomp", "140", "flow" і т.д.
  */
 void legacy_handle_text(const char *msg);
+bool legacy_handle_command(const char *msg);
 
 /**
  * Опціонально: чи це “сенсорне” повідомлення типу TDS/температура.

@@ -73,6 +73,17 @@ static uint32_t   s_disconnected_since_ms = 0;
 static uint32_t   s_last_reconnect_attempt_ms = 0;
 static uint32_t   s_last_mesh_restart_ms = 0;
 static TaskHandle_t s_mesh_reconnect_task = NULL;
+static volatile bool s_mesh_service_started = false;
+
+typedef enum {
+	MESH_SERVICE_RECOVERY_IDLE = 0,
+	MESH_SERVICE_RECOVERY_STOPPING,
+	MESH_SERVICE_RECOVERY_STARTING,
+} mesh_service_recovery_t;
+
+static volatile mesh_service_recovery_t s_mesh_service_recovery =
+	MESH_SERVICE_RECOVERY_IDLE;
+static uint32_t s_mesh_service_action_ms = 0;
 
 typedef enum {
 	ROOT_RECOVERY_OK = 0,
@@ -137,6 +148,9 @@ static void mesh_event_handler(void *arg,
 static void mesh_rx_task(void *arg);
 static void mesh_reconnect_watchdog_task(void *arg);
 static esp_err_t mesh_comm_start(void);
+static esp_err_t mesh_service_init_and_start(void);
+static esp_err_t mesh_service_request_restart(uint32_t now);
+static bool mesh_service_recovery_step(uint32_t now);
 
 static uint32_t tick_ms(void)
 {
@@ -480,15 +494,24 @@ static void mesh_rx_task(void *arg)
 	mesh_addr_t	from;
 	int		flag = 0;
 	esp_err_t	err;
+	uint32_t last_error_log_ms = 0;
 
 	while (is_running) {
 		data.size = sizeof(rx_buf);
 
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
-			ESP_LOGE(MESH_TAG, "esp_mesh_recv failed: 0x%x (%s)", err, esp_err_to_name(err));
+			uint32_t now = tick_ms();
+			if (last_error_log_ms == 0 ||
+			    (uint32_t)(now - last_error_log_ms) >= 5000U) {
+				last_error_log_ms = now;
+				ESP_LOGE(MESH_TAG, "esp_mesh_recv failed: 0x%x (%s)",
+					 err, esp_err_to_name(err));
+			}
+			vTaskDelay(pdMS_TO_TICKS(250));
 			continue;
 		}
+		last_error_log_ms = 0;
 
 		if (data.size < sizeof(mesh_pkt_hdr_t)) {
 			ESP_LOGW(MESH_TAG, "RX too short: %d bytes", (int)data.size);
@@ -582,6 +605,138 @@ static esp_err_t mesh_comm_start(void)
 	return ESP_OK;
 }
 
+static esp_err_t mesh_service_init_and_start(void)
+{
+	esp_err_t err = esp_mesh_init();
+	if (err != ESP_OK) return err;
+
+	err = esp_mesh_fix_root(false);
+	if (err != ESP_OK) return err;
+	err = esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY);
+	if (err != ESP_OK) return err;
+
+	mesh_max_layer = CONFIG_MESH_MAX_LAYER;
+#if CONFIG_CHOINKA_DIRECT_ROOT_ONLY
+	if (mesh_max_layer > CONFIG_CHOINKA_DIRECT_MAX_LAYER) {
+		mesh_max_layer = CONFIG_CHOINKA_DIRECT_MAX_LAYER;
+	}
+#endif
+	err = esp_mesh_set_max_layer(mesh_max_layer);
+	if (err != ESP_OK) return err;
+	err = esp_mesh_set_vote_percentage(1);
+	if (err != ESP_OK) return err;
+	err = esp_mesh_set_xon_qsize(128);
+	if (err != ESP_OK) return err;
+	err = esp_mesh_disable_ps();
+	if (err != ESP_OK) return err;
+	err = esp_mesh_set_ap_assoc_expire(10);
+	if (err != ESP_OK) return err;
+
+	mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
+	memcpy(cfg.mesh_id.addr, MESH_ID, sizeof(MESH_ID));
+	cfg.channel = CONFIG_MESH_CHANNEL;
+	size_t router_ssid_len = 0;
+	err = copy_mesh_config_string(cfg.router.ssid, sizeof(cfg.router.ssid),
+				      CONFIG_MESH_ROUTER_SSID, &router_ssid_len,
+				      "router ssid");
+	if (err != ESP_OK) return err;
+	cfg.router.ssid_len = (uint8_t)router_ssid_len;
+	err = copy_mesh_config_string(cfg.router.password,
+				      sizeof(cfg.router.password),
+				      CONFIG_MESH_ROUTER_PASSWD, NULL,
+				      "router password");
+	if (err != ESP_OK) return err;
+
+	err = esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE);
+	if (err != ESP_OK) return err;
+	cfg.mesh_ap.max_connection = CONFIG_MESH_AP_CONNECTIONS;
+	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
+	err = copy_mesh_config_string(cfg.mesh_ap.password,
+				      sizeof(cfg.mesh_ap.password),
+				      CONFIG_MESH_AP_PASSWD, NULL,
+				      "mesh ap password");
+	if (err != ESP_OK) return err;
+	err = esp_mesh_set_config(&cfg);
+	if (err != ESP_OK) return err;
+
+	ESP_LOGI(MESH_TAG,
+		 "mesh service configured max_layer:%u direct_root_only:%u",
+		 (unsigned)mesh_max_layer,
+		 (unsigned)CONFIG_CHOINKA_DIRECT_ROOT_ONLY);
+	return esp_mesh_start();
+}
+
+static esp_err_t mesh_service_request_restart(uint32_t now)
+{
+	if (s_mesh_service_recovery != MESH_SERVICE_RECOVERY_IDLE) {
+		return ESP_OK;
+	}
+
+	s_mesh_service_action_ms = now;
+	if (!s_mesh_service_started) {
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		return ESP_OK;
+	}
+
+	s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STOPPING;
+	esp_err_t err = esp_mesh_stop();
+	diag_note_send_err(err);
+	if (err != ESP_OK) {
+		ESP_LOGW(MESH_TAG, "mesh service stop request failed: %s",
+			 esp_err_to_name(err));
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		s_mesh_service_action_ms = 0;
+	}
+	return err;
+}
+
+static bool mesh_service_recovery_step(uint32_t now)
+{
+	mesh_service_recovery_t state = s_mesh_service_recovery;
+	if (state == MESH_SERVICE_RECOVERY_IDLE) {
+		if (s_mesh_service_started) return false;
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		s_mesh_service_action_ms = 0;
+		state = MESH_SERVICE_RECOVERY_STARTING;
+	}
+
+	if (state == MESH_SERVICE_RECOVERY_STOPPING) {
+		if (!s_mesh_service_started) {
+			s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+			s_mesh_service_action_ms = 0;
+		} else if ((uint32_t)(now - s_mesh_service_action_ms) >= 10000U) {
+			s_mesh_service_action_ms = now;
+			esp_err_t err = esp_mesh_stop();
+			diag_note_send_err(err);
+			if (err != ESP_OK) {
+				ESP_LOGW(MESH_TAG, "mesh service stop retry failed: %s",
+					 esp_err_to_name(err));
+			}
+		}
+		return true;
+	}
+
+	if (s_mesh_service_started) {
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_IDLE;
+		s_mesh_service_action_ms = 0;
+		return false;
+	}
+	if (s_mesh_service_action_ms == 0 ||
+	    (uint32_t)(now - s_mesh_service_action_ms) >= 5000U) {
+		s_mesh_service_action_ms = now;
+		esp_err_t err = esp_mesh_start();
+		if (err == ESP_ERR_MESH_NOT_INIT) {
+			err = mesh_service_init_and_start();
+		}
+		diag_note_send_err(err);
+		if (err != ESP_OK) {
+			ESP_LOGW(MESH_TAG, "mesh service start retry failed: %s",
+				 esp_err_to_name(err));
+		}
+	}
+	return true;
+}
+
 static void root_liveness_watchdog_step(void)
 {
 	uint32_t now = tick_ms();
@@ -646,22 +801,8 @@ static void root_liveness_watchdog_step(void)
 		                            mesh_log_stream_last_send_err());
 		mesh_v2_node_on_mesh_disconnected();
 		mesh_log_stream_on_mesh_disconnected();
-
-		esp_err_t stop_err = esp_mesh_stop();
-		diag_note_send_err(stop_err);
-		if (stop_err != ESP_OK) {
-			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_stop failed: %s",
-			         esp_err_to_name(stop_err));
-		}
-		vTaskDelay(pdMS_TO_TICKS(1000));
 		note_mesh_disconnected();
-		(void)esp_mesh_flush_scan_result();
-		esp_err_t start_err = esp_mesh_start();
-		diag_note_send_err(start_err);
-		if (start_err != ESP_OK) {
-			ESP_LOGW(MESH_TAG, "root recovery: esp_mesh_start failed: %s",
-			         esp_err_to_name(start_err));
-		}
+		(void)mesh_service_request_restart(now);
 		return;
 	}
 
@@ -703,13 +844,17 @@ static void mesh_reconnect_watchdog_task(void *arg)
 
 	for (;;) {
 		vTaskDelay(pdMS_TO_TICKS(MESH_RECONNECT_CHECK_MS));
+		uint32_t now = tick_ms();
+
+		if (mesh_service_recovery_step(now)) {
+			continue;
+		}
 
 		if (is_mesh_connected) {
 			root_liveness_watchdog_step();
 			continue;
 		}
 
-		uint32_t now = tick_ms();
 		if (s_disconnected_since_ms == 0) {
 			s_disconnected_since_ms = now;
 			continue;
@@ -754,32 +899,8 @@ static void mesh_reconnect_watchdog_task(void *arg)
 
 			mesh_v2_node_on_mesh_disconnected();
 			mesh_log_stream_on_mesh_disconnected();
-
-			esp_err_t stop_err = esp_mesh_stop();
-			diag_note_send_err(stop_err);
-			if (stop_err != ESP_OK) {
-				ESP_LOGW(MESH_TAG,
-				         "mesh reconnect watchdog: esp_mesh_stop failed: %s",
-				         esp_err_to_name(stop_err));
-			}
-
-			vTaskDelay(pdMS_TO_TICKS(1000));
 			note_mesh_disconnected();
-			esp_err_t flush_err = esp_mesh_flush_scan_result();
-			diag_note_send_err(flush_err);
-			if (flush_err != ESP_OK) {
-				ESP_LOGW(MESH_TAG,
-				         "mesh reconnect watchdog: scan flush before restart failed: %s",
-				         esp_err_to_name(flush_err));
-			}
-
-			esp_err_t start_err = esp_mesh_start();
-			diag_note_send_err(start_err);
-			if (start_err != ESP_OK) {
-				ESP_LOGW(MESH_TAG,
-				         "mesh reconnect watchdog: esp_mesh_start failed: %s",
-				         esp_err_to_name(start_err));
-			}
+			(void)mesh_service_request_restart(now);
 		}
 	}
 }
@@ -798,6 +919,9 @@ static void mesh_event_handler(void *arg,
 
 	switch (event_id) {
 	case MESH_EVENT_STARTED: {
+		s_mesh_service_started = true;
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_IDLE;
+		s_mesh_service_action_ms = 0;
 		esp_mesh_get_id(&id);
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_STARTED> ID:" MACSTR,
@@ -808,6 +932,9 @@ static void mesh_event_handler(void *arg,
 	break;
 
 	case MESH_EVENT_STOPPED: {
+		s_mesh_service_started = false;
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		s_mesh_service_action_ms = 0;
 		ESP_LOGI(MESH_TAG, "<MESH_EVENT_STOPPED>");
 		note_mesh_disconnected();
 		mesh_layer = esp_mesh_get_layer();
@@ -1033,7 +1160,6 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_wifi_start());
 
 	// MESH
-	ESP_ERROR_CHECK(esp_mesh_init());
 	ESP_ERROR_CHECK(
 	    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
 	                               &mesh_event_handler, NULL));
@@ -1043,62 +1169,7 @@ void app_main(void)
 	mesh_log_stream_init(MESH_TAG);
 	ESP_ERROR_CHECK(mesh_ota_receiver_start());
 
-	// This is a regular remote node. Only node0 fixes itself as MESH_ROOT.
-	ESP_ERROR_CHECK(esp_mesh_fix_root(false));
-
-	ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
-	mesh_max_layer = CONFIG_MESH_MAX_LAYER;
-#if CONFIG_CHOINKA_DIRECT_ROOT_ONLY
-	if (mesh_max_layer > CONFIG_CHOINKA_DIRECT_MAX_LAYER) {
-		mesh_max_layer = CONFIG_CHOINKA_DIRECT_MAX_LAYER;
-	}
-#endif
-	ESP_ERROR_CHECK(esp_mesh_set_max_layer(mesh_max_layer));
-	ESP_LOGI(MESH_TAG,
-	         "mesh max layer:%u (configured:%u, direct_root_only:%u)",
-	         (unsigned)mesh_max_layer,
-	         (unsigned)CONFIG_MESH_MAX_LAYER,
-	         (unsigned)CONFIG_CHOINKA_DIRECT_ROOT_ONLY);
-	ESP_ERROR_CHECK(esp_mesh_set_vote_percentage(1));
-	ESP_ERROR_CHECK(esp_mesh_set_xon_qsize(128));
-
-	ESP_ERROR_CHECK(esp_mesh_disable_ps());
-	ESP_ERROR_CHECK(esp_mesh_set_ap_assoc_expire(10));
-
-
-	mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
-
-	// mesh_id
-	memcpy(cfg.mesh_id.addr, MESH_ID, 6);
-
-	// Router-facing Wi-Fi credentials from menuconfig.
-	cfg.channel        = CONFIG_MESH_CHANNEL;
-	size_t router_ssid_len = 0;
-	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.ssid,
-	                                        sizeof(cfg.router.ssid),
-	                                        CONFIG_MESH_ROUTER_SSID,
-	                                        &router_ssid_len,
-	                                        "router ssid"));
-	cfg.router.ssid_len = (uint8_t)router_ssid_len;
-	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.router.password,
-	                                        sizeof(cfg.router.password),
-	                                        CONFIG_MESH_ROUTER_PASSWD,
-	                                        NULL,
-	                                        "router password"));
-
-	// Mesh AP for child nodes.
-	ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
-	cfg.mesh_ap.max_connection        = CONFIG_MESH_AP_CONNECTIONS;
-	cfg.mesh_ap.nonmesh_max_connection = CONFIG_MESH_NON_MESH_AP_CONNECTIONS;
-	ESP_ERROR_CHECK(copy_mesh_config_string(cfg.mesh_ap.password,
-	                                        sizeof(cfg.mesh_ap.password),
-	                                        CONFIG_MESH_AP_PASSWD,
-	                                        NULL,
-	                                        "mesh ap password"));
-
-	ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
-
-	ESP_ERROR_CHECK(esp_mesh_start());
+	ESP_ERROR_CHECK(mesh_service_init_and_start());
 	if (!s_mesh_reconnect_task) {
 		xTaskCreate(mesh_reconnect_watchdog_task,
 		            "mesh_reconn",

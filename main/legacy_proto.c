@@ -33,9 +33,9 @@ bool legacy_is_sensor_value(const char *msg)
 	return false;
 }
 
-void legacy_handle_text(const char *msg)
+bool legacy_handle_command(const char *msg)
 {
-	if (!msg) return;
+	if (!msg) return false;
 
 	// зробимо копію, щоб трохи “почистити” (trim)
 	char buf[64];
@@ -51,26 +51,26 @@ void legacy_handle_text(const char *msg)
 		}
 	}
 
-	if (!buf[0]) return;
+	if (!buf[0]) return false;
 
 	// ---- 1) Команди типу "readtds", "pm1", "pomp", "140" ... ----
 	if (streq(buf, "readtds")) {
 		ESP_LOGI(LEG_TAG, "[CMD] readtds  (тут включиш TDS state-machine)");
 		// TODO: виклик твоєї функції, яка стартує вимір TDS + відправку
 		// start_tds_measurement(true);
-		return;
+		return true;
 	}
 
 	if (streq(buf, "pm1")) {
 		ESP_LOGI(LEG_TAG, "[CMD] pm1  (старий режим pmm.state = WAKE)");
 		// TODO: виклик твого нового коду, який робить те саме, що старий handleBody("pm1")
-		return;
+		return true;
 	}
 
 	if (streq(buf, "pomp")) {
 		ESP_LOGI(LEG_TAG, "[CMD] pomp  (включити помпу)");
 		// TODO: relControl.pimp() еквівалент
-		return;
+		return true;
 	}
 
 	if (streq(buf, "140") ||
@@ -79,31 +79,31 @@ void legacy_handle_text(const char *msg)
 	    streq(buf, "143")) {
 		ESP_LOGI(LEG_TAG, "[CMD] turbo mode = %s", buf);
 		// TODO: виставити ту ж туurbo-логіку, що й раніше
-		return;
+		return true;
 	}
 
 	if (streq(buf, "flow")) {
 		ESP_LOGI(LEG_TAG, "[CMD] flow");
 		// TODO: relControl.flo();
-		return;
+		return true;
 	}
 
 	if (streq(buf, "ion")) {
 		ESP_LOGI(LEG_TAG, "[CMD] ion");
 		// TODO: relControl.ionn();
-		return;
+		return true;
 	}
 
 	if (streq(buf, "echo_turb")) {
 		ESP_LOGI(LEG_TAG, "[CMD] echo_turb");
 		// TODO: eho();
-		return;
+		return true;
 	}
 
 	if (streq(buf, "huOn")) {
 		ESP_LOGI(LEG_TAG, "[CMD] huOn (power)");
 		// TODO: relControl.power();
-		return;
+		return true;
 	}
 
 	// ---- 2) Сенсорні значення типу "TDSB123", "TDS456", "ttds25" ----
@@ -112,7 +112,7 @@ void legacy_handle_text(const char *msg)
 		float broth_ppm = atof(p);
 		ESP_LOGI(LEG_TAG, "[SENSOR] TDS broth @25°C ≈ %.1f ppm", broth_ppm);
 		// TODO: зберегти кудись broth_ppm
-		return;
+		return true;
 	}
 
 	if (starts_with(buf, "TDS")) {
@@ -120,7 +120,7 @@ void legacy_handle_text(const char *msg)
 		float tds_ppm = atof(p);
 		ESP_LOGI(LEG_TAG, "[SENSOR] TDS@25°C ≈ %.1f ppm", tds_ppm);
 		// TODO: зберегти tds_ppm
-		return;
+		return true;
 	}
 
 	if (starts_with(buf, "ttds")) {
@@ -128,9 +128,15 @@ void legacy_handle_text(const char *msg)
 		float temp_c = atof(p);
 		ESP_LOGI(LEG_TAG, "[SENSOR] temp for TDS ≈ %.2f °C", temp_c);
 		// TODO: зберегти temp_c (калібровка / лог)
-		return;
+		return true;
 	}
 
 	// ---- 3) Якщо нічого не підійшло ----
 	ESP_LOGW(LEG_TAG, "unknown legacy msg: \"%s\"", buf);
+	return false;
+}
+
+void legacy_handle_text(const char *msg)
+{
+	(void)legacy_handle_command(msg);
 }
