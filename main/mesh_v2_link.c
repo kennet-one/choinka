@@ -89,6 +89,7 @@ typedef struct {
 
 static command_cache_t s_command_cache[32];
 static uint8_t s_command_cache_next = 0;
+static uint32_t s_debug_dedupe_action_count = 0;
 
 static void mac_copy(uint8_t dst[6], const uint8_t src[6]);
 static void local_mac(uint8_t mac[6]);
@@ -205,7 +206,14 @@ static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
 
 	uint8_t status = MESH_V2_CONTROL_STATUS_OK;
 	const char *result_text = "accepted";
-	if (strcmp(text, "@log:1") == 0 || strcmp(text, "@log:0") == 0) {
+	char debug_result[48];
+	if (strcmp(text, "@dbg:dedupe") == 0) {
+		s_debug_dedupe_action_count++;
+		snprintf(debug_result, sizeof(debug_result),
+		         "debug action count=%lu",
+		         (unsigned long)s_debug_dedupe_action_count);
+		result_text = debug_result;
+	} else if (strcmp(text, "@log:1") == 0 || strcmp(text, "@log:0") == 0) {
 		mesh_log_ctrl_packet_t ctrl = {0};
 		ctrl.h.magic = MESH_PKT_MAGIC;
 		ctrl.h.version = MESH_PKT_VERSION;
