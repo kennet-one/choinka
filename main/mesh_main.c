@@ -757,10 +757,11 @@ static void root_liveness_watchdog_step(void)
 
 	uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
 	root_recovery_phase_t phase = ROOT_RECOVERY_WAIT_ACK;
+	bool ota_active = mesh_ota_receiver_active();
 
-	if (down_ms >= ROOT_RECOVERY_HARD_MS) {
+	if (!ota_active && down_ms >= ROOT_RECOVERY_HARD_MS) {
 		phase = ROOT_RECOVERY_MESH_RESTART;
-	} else if (down_ms >= ROOT_RECOVERY_SOFT_MS) {
+	} else if (!ota_active && down_ms >= ROOT_RECOVERY_SOFT_MS) {
 		phase = ROOT_RECOVERY_MESH_RECONNECT;
 	} else if (down_ms >= ROOT_RECOVERY_BURST_MS) {
 		phase = ROOT_RECOVERY_NODEINFO_BURST;
@@ -771,7 +772,7 @@ static void root_liveness_watchdog_step(void)
 	if (s_last_root_burst_ms == 0 ||
 	    (uint32_t)(now - s_last_root_burst_ms) >= ROOT_RECOVERY_BURST_MS) {
 		s_last_root_burst_ms = now;
-		bool reset_v2_session = down_ms >= ROOT_RECOVERY_RESET_MS;
+		bool reset_v2_session = !ota_active && down_ms >= ROOT_RECOVERY_RESET_MS;
 		esp_err_t hello_err = mesh_v2_node_force_hello(reset_v2_session);
 		diag_note_send_err(hello_err);
 		update_v2_topology(false);
@@ -788,7 +789,8 @@ static void root_liveness_watchdog_step(void)
 		                            err != ESP_OK ? err : topo_err);
 	}
 
-	if (down_ms >= ROOT_RECOVERY_HARD_MS &&
+	if (!ota_active &&
+	    down_ms >= ROOT_RECOVERY_HARD_MS &&
 	    (s_last_root_hard_restart_ms == 0 ||
 	     (uint32_t)(now - s_last_root_hard_restart_ms) >= ROOT_RECOVERY_HARD_MS)) {
 		s_last_root_hard_restart_ms = now;
@@ -806,7 +808,8 @@ static void root_liveness_watchdog_step(void)
 		return;
 	}
 
-	if (down_ms >= ROOT_RECOVERY_SOFT_MS &&
+	if (!ota_active &&
+	    down_ms >= ROOT_RECOVERY_SOFT_MS &&
 	    (s_last_root_soft_reconnect_ms == 0 ||
 	     (uint32_t)(now - s_last_root_soft_reconnect_ms) >= ROOT_RECOVERY_SOFT_MS)) {
 		s_last_root_soft_reconnect_ms = now;

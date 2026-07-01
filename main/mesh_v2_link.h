@@ -51,6 +51,7 @@ esp_err_t mesh_v2_node_send_nodeinfo(void);
 esp_err_t mesh_v2_node_send_log_line(const char *line);
 esp_err_t mesh_v2_node_send_topology(void);
 esp_err_t mesh_v2_node_send_memory(void);
+esp_err_t mesh_v2_node_send_ota_status(const mesh_v2_ota_status_payload_t *status);
 esp_err_t mesh_v2_node_send_event(uint32_t command_id, const char *text);
 bool mesh_v2_node_reliable_ready(void);
 bool mesh_v2_node_reliable_stats(keemash_rel_stats_t *out);

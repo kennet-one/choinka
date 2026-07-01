@@ -21,6 +21,7 @@
 #include "keemash_mesh_core.h"
 #include "legacy_proto.h"
 #include "mesh_log_stream.h"
+#include "mesh_ota_receiver.h"
 #include "mesh_proto.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -184,6 +185,11 @@ static void rel_deliver_cb(void *user, const uint8_t peer[6], uint8_t channel,
 		(void)mesh_v2_node_send_memory();
 		return;
 	}
+	if (channel == MESH_V2_TUNNEL_CHANNEL_OTA &&
+	    payload_len >= sizeof(mesh_v2_ota_common_payload_t)) {
+		(void)mesh_ota_receiver_handle_v2(payload, payload_len);
+		return;
+	}
 	if (channel != MESH_V2_TUNNEL_CHANNEL_CONTROL ||
 	    payload_len < offsetof(mesh_v2_control_payload_t, text)) {
 		return;
@@ -260,7 +266,7 @@ static void rel_poll_task(void *arg)
 					(uint32_t)(esp_timer_get_time() / 1000000ULL),
 					MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY |
 					MESH_V2_CAP_TOPOLOGY | MESH_V2_CAP_TYPED_CONTROL |
-					MESH_V2_CAP_TYPED_MEMORY);
+					MESH_V2_CAP_TYPED_MEMORY | MESH_V2_CAP_OTA);
 				s_rel_last_hello_ms = now;
 			}
 			xSemaphoreGiveRecursive(s_rel_lock);
@@ -740,7 +746,7 @@ static esp_err_t send_hello(bool reset_session)
 			(uint32_t)(esp_timer_get_time() / 1000000ULL),
 			MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY |
 			MESH_V2_CAP_TOPOLOGY | MESH_V2_CAP_TYPED_CONTROL |
-			MESH_V2_CAP_TYPED_MEMORY);
+			MESH_V2_CAP_TYPED_MEMORY | MESH_V2_CAP_OTA);
 		xSemaphoreGiveRecursive(s_rel_lock);
 		if (err == ESP_OK) err = rel_err;
 	}
@@ -775,6 +781,9 @@ static void recover_root_link_if_needed(void)
 	portEXIT_CRITICAL(&s_lock);
 
 	if (send) {
+		if (mesh_ota_receiver_active()) {
+			reset = false;
+		}
 		if (reset) {
 			ESP_LOGW(TAG, "root ACK stale, restarting V2 session");
 		}
@@ -796,7 +805,7 @@ void mesh_v2_node_init(const char *tag)
 
 void mesh_v2_node_on_mesh_connected(void)
 {
-	send_hello(true);
+	send_hello(!mesh_ota_receiver_active());
 }
 
 void mesh_v2_node_on_mesh_disconnected(void)
@@ -990,7 +999,8 @@ esp_err_t mesh_v2_node_send_topology(void)
 	p.v2.base.capabilities = MESH_V2_CAP_TUNNEL | MESH_V2_CAP_RELAY |
 	                         MESH_V2_CAP_TOPOLOGY | MESH_V2_CAP_RELIABLE_E2E |
 	                         MESH_V2_CAP_SACK | MESH_V2_CAP_FRAGMENT |
-	                         MESH_V2_CAP_TYPED_CONTROL | MESH_V2_CAP_TYPED_MEMORY;
+	                         MESH_V2_CAP_TYPED_CONTROL | MESH_V2_CAP_TYPED_MEMORY |
+	                         MESH_V2_CAP_OTA;
 	p.v2.base.v1_ok_age_ms = mesh_log_stream_root_ok_age_ms();
 	p.v2.base.v2_ack_age_ms = mesh_v2_node_ack_age_ms();
 	p.v2.base.last_send_err = diag.last_mesh_send_err;
@@ -1171,6 +1181,21 @@ esp_err_t mesh_v2_node_send_memory(void)
 	}
 	esp_err_t err = keemash_rel_send(s_rel, root,
 		MESH_V2_TUNNEL_CHANNEL_MEMORY, &p, sizeof(p),
+		KEEMASH_REL_PRIORITY_HIGH);
+	xSemaphoreGiveRecursive(s_rel_lock);
+	return err;
+}
+
+esp_err_t mesh_v2_node_send_ota_status(const mesh_v2_ota_status_payload_t *status)
+{
+	if (!status) return ESP_ERR_INVALID_ARG;
+	if (!s_rel || !s_rel_lock) return ESP_ERR_INVALID_STATE;
+	const uint8_t root[6] = {0};
+	if (xSemaphoreTakeRecursive(s_rel_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+		return ESP_ERR_TIMEOUT;
+	}
+	esp_err_t err = keemash_rel_send(s_rel, root,
+		MESH_V2_TUNNEL_CHANNEL_OTA, status, sizeof(*status),
 		KEEMASH_REL_PRIORITY_HIGH);
 	xSemaphoreGiveRecursive(s_rel_lock);
 	return err;
