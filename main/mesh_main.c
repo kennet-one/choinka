@@ -43,6 +43,8 @@
 #define ROOT_RECOVERY_SOFT_MS   20000U
 #define ROOT_RECOVERY_HARD_MS   45000U
 #define ROOT_RECOVERY_LOG_MS    15000U
+#define MESH_SERVICE_STOP_RETRY_MS   10000U
+#define MESH_SERVICE_STOP_TIMEOUT_MS 30000U
 #define MANUAL_REBOOT_DELAY_MIN_MS 500U
 #define MANUAL_REBOOT_DELAY_MAX_MS 5000U
 #define MANUAL_REBOOT_DELAY_DEFAULT_MS 1200U
@@ -84,6 +86,7 @@ typedef enum {
 static volatile mesh_service_recovery_t s_mesh_service_recovery =
 	MESH_SERVICE_RECOVERY_IDLE;
 static uint32_t s_mesh_service_action_ms = 0;
+static uint32_t s_mesh_service_stop_started_ms = 0;
 
 typedef enum {
 	ROOT_RECOVERY_OK = 0,
@@ -679,6 +682,7 @@ static esp_err_t mesh_service_request_restart(uint32_t now)
 	}
 
 	s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STOPPING;
+	s_mesh_service_stop_started_ms = now;
 	esp_err_t err = esp_mesh_stop();
 	diag_note_send_err(err);
 	if (err != ESP_OK) {
@@ -686,6 +690,7 @@ static esp_err_t mesh_service_request_restart(uint32_t now)
 			 esp_err_to_name(err));
 		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
 		s_mesh_service_action_ms = 0;
+		s_mesh_service_stop_started_ms = 0;
 	}
 	return err;
 }
@@ -704,13 +709,35 @@ static bool mesh_service_recovery_step(uint32_t now)
 		if (!s_mesh_service_started) {
 			s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
 			s_mesh_service_action_ms = 0;
-		} else if ((uint32_t)(now - s_mesh_service_action_ms) >= 10000U) {
+			s_mesh_service_stop_started_ms = 0;
+		} else if (s_mesh_service_stop_started_ms != 0 &&
+		           (uint32_t)(now - s_mesh_service_stop_started_ms) >=
+		           MESH_SERVICE_STOP_TIMEOUT_MS) {
+			ESP_LOGW(MESH_TAG,
+			         "mesh service stop timeout after %lu ms; forcing local restart state",
+			         (unsigned long)(uint32_t)(now - s_mesh_service_stop_started_ms));
+			mesh_v2_node_on_mesh_disconnected();
+			mesh_log_stream_on_mesh_disconnected();
+			note_mesh_disconnected();
+			s_mesh_service_started = false;
+			s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+			s_mesh_service_action_ms = 0;
+			s_mesh_service_stop_started_ms = 0;
+		} else if ((uint32_t)(now - s_mesh_service_action_ms) >=
+		           MESH_SERVICE_STOP_RETRY_MS) {
 			s_mesh_service_action_ms = now;
 			esp_err_t err = esp_mesh_stop();
 			diag_note_send_err(err);
 			if (err != ESP_OK) {
 				ESP_LOGW(MESH_TAG, "mesh service stop retry failed: %s",
 					 esp_err_to_name(err));
+				if (err == ESP_ERR_MESH_NOT_START ||
+				    err == ESP_ERR_INVALID_STATE) {
+					s_mesh_service_started = false;
+					s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+					s_mesh_service_action_ms = 0;
+					s_mesh_service_stop_started_ms = 0;
+				}
 			}
 		}
 		return true;
@@ -729,6 +756,7 @@ static bool mesh_service_recovery_step(uint32_t now)
 			err = mesh_service_init_and_start();
 		}
 		diag_note_send_err(err);
+		s_mesh_service_stop_started_ms = 0;
 		if (err != ESP_OK) {
 			ESP_LOGW(MESH_TAG, "mesh service start retry failed: %s",
 				 esp_err_to_name(err));
@@ -925,6 +953,7 @@ static void mesh_event_handler(void *arg,
 		s_mesh_service_started = true;
 		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_IDLE;
 		s_mesh_service_action_ms = 0;
+		s_mesh_service_stop_started_ms = 0;
 		esp_mesh_get_id(&id);
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_STARTED> ID:" MACSTR,
@@ -938,6 +967,7 @@ static void mesh_event_handler(void *arg,
 		s_mesh_service_started = false;
 		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
 		s_mesh_service_action_ms = 0;
+		s_mesh_service_stop_started_ms = 0;
 		ESP_LOGI(MESH_TAG, "<MESH_EVENT_STOPPED>");
 		note_mesh_disconnected();
 		mesh_layer = esp_mesh_get_layer();
