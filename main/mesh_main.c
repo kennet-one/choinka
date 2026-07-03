@@ -38,6 +38,7 @@
 #define MESH_RECONNECT_SOFT_MS  20000U
 #define MESH_RECONNECT_HARD_MS  60000U
 #define ROOT_ACK_FRESH_MS       30000U
+#define ROOT_RX_FRESH_MS        30000U
 #define ROOT_RECOVERY_BURST_MS  5000U
 #define ROOT_RECOVERY_RESET_MS  15000U
 #define ROOT_RECOVERY_SOFT_MS   20000U
@@ -102,6 +103,7 @@ static uint32_t s_last_root_burst_ms = 0;
 static uint32_t s_last_root_soft_reconnect_ms = 0;
 static uint32_t s_last_root_hard_restart_ms = 0;
 static uint32_t s_last_root_recovery_log_ms = 0;
+static uint32_t s_last_root_rx_ms = 0;
 static bool s_manual_reboot_pending = false;
 static uint16_t s_manual_reboot_delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
 
@@ -196,9 +198,94 @@ static void diag_note_recovery_reason(uint32_t now, uint8_t reason)
 	s_last_recovery_action_ms = now;
 }
 
+static bool mac_is_zero(const uint8_t mac[6])
+{
+	static const uint8_t zero[6] = {0};
+	return !mac || memcmp(mac, zero, sizeof(zero)) == 0;
+}
+
+static bool mac_equal(const uint8_t a[6], const uint8_t b[6])
+{
+	return a && b && memcmp(a, b, 6) == 0;
+}
+
+static void note_root_rx_from_mac(const uint8_t src_mac[6])
+{
+	if (!src_mac || mac_is_zero(mesh_root_addr)) {
+		return;
+	}
+	if (mac_equal(src_mac, mesh_root_addr)) {
+		s_last_root_rx_ms = tick_ms();
+	}
+}
+
+static void note_root_rx_now(void)
+{
+	s_last_root_rx_ms = tick_ms();
+}
+
+static void note_root_rx_from_v2(const mesh_v2_hdr_t *h)
+{
+	if (!h) {
+		return;
+	}
+
+	switch (h->type) {
+	case MESH_V2_TYPE_ACK:
+	case MESH_V2_TYPE_NACK:
+	case MESH_V2_TYPE_TUNNEL_ACK:
+	case MESH_V2_TYPE_TUNNEL_NACK:
+	case MESH_V2_TYPE_RELIABLE_HELLO_ACK:
+	case MESH_V2_TYPE_RELIABLE_ACK:
+	case MESH_V2_TYPE_RELIABLE_NACK:
+	case MESH_V2_TYPE_RELIABLE_DATA:
+		note_root_rx_now();
+		return;
+	default:
+		note_root_rx_from_mac(h->src_mac);
+		return;
+	}
+}
+
+static void note_root_rx_from_v1(const mesh_pkt_hdr_t *h)
+{
+	if (!h) {
+		return;
+	}
+
+	switch (h->type) {
+	case MESH_TIME_SYNC_TYPE_TIME:
+	case MESH_LOG_TYPE_CTRL:
+	case MESH_REBOOT_TYPE_REQUEST:
+	case MESH_OTA_TYPE_BEGIN:
+	case MESH_OTA_TYPE_DATA:
+	case MESH_OTA_TYPE_END:
+	case MESH_OTA_TYPE_ABORT:
+		note_root_rx_now();
+		return;
+	default:
+		note_root_rx_from_mac(h->src_mac);
+		return;
+	}
+}
+
+static uint32_t root_rx_age_ms(void)
+{
+	if (s_last_root_rx_ms == 0) {
+		return UINT32_MAX;
+	}
+	return (uint32_t)(tick_ms() - s_last_root_rx_ms);
+}
+
+static bool root_rx_health_fresh(void)
+{
+	return root_rx_age_ms() <= ROOT_RX_FRESH_MS;
+}
+
 static bool root_ack_health_fresh(void)
 {
-	return mesh_v2_node_ack_fresh(ROOT_ACK_FRESH_MS);
+	return mesh_v2_node_ack_fresh(ROOT_ACK_FRESH_MS) &&
+	       root_rx_health_fresh();
 }
 
 static void diag_note_ack_stale(uint32_t now)
@@ -304,6 +391,7 @@ static void note_mesh_disconnected(void)
 	mesh_log_stream_clear_root_ok();
 	s_root_unhealthy_since_ms = 0;
 	s_last_root_burst_ms = 0;
+	s_last_root_rx_ms = 0;
 }
 
 static void note_mesh_connected(void)
@@ -339,9 +427,10 @@ static void root_recovery_reset_ok(uint32_t now)
 	if (s_root_recovery_phase != ROOT_RECOVERY_OK && s_root_unhealthy_since_ms != 0) {
 		uint32_t down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
 		ESP_LOGI(MESH_TAG,
-		         "root recovery: restored after %lu ms, ack_age=%lu tx_age=%lu",
+		         "root recovery: restored after %lu ms, ack_age=%lu rx_age=%lu tx_age=%lu",
 		         (unsigned long)down_ms,
 		         (unsigned long)mesh_v2_node_ack_age_ms(),
+		         (unsigned long)root_rx_age_ms(),
 		         (unsigned long)mesh_log_stream_root_ok_age_ms());
 	}
 	s_root_recovery_phase = ROOT_RECOVERY_OK;
@@ -369,10 +458,11 @@ static void root_recovery_log_throttled(uint32_t now, uint32_t down_ms,
 	s_last_root_recovery_log_ms = now;
 	mesh_v2_node_set_recovery_phase((uint8_t)phase);
 	ESP_LOGW(MESH_TAG,
-	         "root recovery: phase=%s down=%lu ms ack_age=%lu tx_age=%lu last_send=%s action=%s",
+	         "root recovery: phase=%s down=%lu ms ack_age=%lu rx_age=%lu tx_age=%lu last_send=%s action=%s",
 	         root_recovery_phase_name(phase),
 	         (unsigned long)down_ms,
 	         (unsigned long)mesh_v2_node_ack_age_ms(),
+	         (unsigned long)root_rx_age_ms(),
 	         (unsigned long)mesh_log_stream_root_ok_age_ms(),
 	         esp_err_to_name(last_err),
 	         action ? action : "watch");
@@ -524,6 +614,10 @@ static void mesh_rx_task(void *arg)
 		const mesh_pkt_hdr_t *h = (const mesh_pkt_hdr_t *)rx_buf;
 
 		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION_V2) {
+			if (data.size >= sizeof(mesh_v2_hdr_t)) {
+				const mesh_v2_hdr_t *v2 = (const mesh_v2_hdr_t *)rx_buf;
+				note_root_rx_from_v2(v2);
+			}
 			mesh_v2_node_handle_rx(rx_buf, data.size);
 			continue;
 		}
@@ -533,6 +627,7 @@ static void mesh_rx_task(void *arg)
 			ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " (%d bytes)", MAC2STR(from.addr), (int)data.size);
 			continue;
 		}
+		note_root_rx_from_v1(h);
 
 		// Packet type dispatcher.
 		if (h->type == MESH_TIME_SYNC_TYPE_TIME) {
