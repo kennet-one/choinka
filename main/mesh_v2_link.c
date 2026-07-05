@@ -11,17 +11,30 @@
 #include "legacy_proto.h"
 #include "mesh_log_stream.h"
 
+void mesh_v2_link_require(void)
+{
+}
+
+static bool mac_is_zero(const uint8_t mac[6])
+{
+	static const uint8_t zero[6] = {0};
+	return !mac || memcmp(mac, zero, sizeof(zero)) == 0;
+}
+
 esp_err_t keemash_mesh_transport_send(const uint8_t dst[6], const void *packet, size_t packet_len)
 {
 	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
-	mesh_addr_t dest = {0};
-	if (dst) memcpy(dest.addr, dst, 6);
 	mesh_data_t data = {
 		.data = (uint8_t *)packet,
 		.size = packet_len,
 		.proto = MESH_PROTO_BIN,
 		.tos = MESH_TOS_P2P,
 	};
+	if (mac_is_zero(dst)) {
+		return mesh_log_stream_send_bin_to_root(packet, packet_len);
+	}
+	mesh_addr_t dest = {0};
+	memcpy(dest.addr, dst, 6);
 	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 

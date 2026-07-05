@@ -111,6 +111,40 @@ static void record_send_result(esp_err_t err)
 	portEXIT_CRITICAL(&s_state_lock);
 }
 
+esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len)
+{
+	static uint32_t last_warn_ms = 0;
+	if (!packet || packet_len == 0) return ESP_ERR_INVALID_ARG;
+	uint32_t now = now_ms();
+	if (!mesh_connected_snapshot()) {
+		record_send_result(ESP_ERR_INVALID_STATE);
+		if (last_warn_ms == 0 || (uint32_t)(now - last_warn_ms) >= 5000U) {
+			last_warn_ms = now;
+			ESP_LOGW(TAG, "root bin send blocked: mesh not connected len=%u", (unsigned)packet_len);
+		}
+		return ESP_ERR_INVALID_STATE;
+	}
+
+	mesh_data_t data;
+	memset(&data, 0, sizeof(data));
+	data.data = (uint8_t *)packet;
+	data.size = packet_len;
+	data.proto = MESH_PROTO_BIN;
+	data.tos = MESH_TOS_P2P;
+
+	mesh_addr_t dest;
+	memset(&dest, 0, sizeof(dest));
+
+	esp_err_t err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	record_send_result(err);
+	if (err != ESP_OK &&
+	    (last_warn_ms == 0 || (uint32_t)(now - last_warn_ms) >= 5000U)) {
+		last_warn_ms = now;
+		ESP_LOGW(TAG, "root bin send failed len=%u err=%s", (unsigned)packet_len, esp_err_to_name(err));
+	}
+	return err;
+}
+
 static esp_err_t send_nodeinfo_to_root(void)
 {
 	if (!mesh_connected_snapshot()) {

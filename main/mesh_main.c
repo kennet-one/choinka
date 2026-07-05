@@ -1293,6 +1293,7 @@ void app_main(void)
 	                               &mesh_event_handler, NULL));
 	mesh_time_sync_init();
 	log_time_vprintf_start();
+	mesh_v2_link_require();
 	mesh_v2_node_init(MESH_TAG);
 	mesh_log_stream_init(MESH_TAG);
 	ESP_ERROR_CHECK(mesh_ota_receiver_start());

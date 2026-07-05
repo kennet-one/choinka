@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -15,6 +16,9 @@ void mesh_log_stream_init(const char *tag);
 // Call when the node is actually connected to mesh (PARENT_CONNECTED).
 void mesh_log_stream_on_mesh_connected(void);
 void mesh_log_stream_on_mesh_disconnected(void);
+
+// Shared mesh send gate for node-to-root binary packets.
+esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len);
 
 // Best-effort immediate NODEINFO beacon used by recovery watchdogs.
 esp_err_t mesh_log_stream_send_nodeinfo_now(void);
