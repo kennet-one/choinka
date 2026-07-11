@@ -1,15 +1,20 @@
 #include "mesh_v2_link.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_err.h"
 #include "esp_mesh.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 
 #include "keemash_mesh_hooks.h"
 #include "legacy_proto.h"
 #include "mesh_log_stream.h"
+#include "pump_node.h"
+
+static uint32_t s_status_command_exec_count = 0;
 
 void mesh_v2_link_require(void)
 {
@@ -46,6 +51,30 @@ void keemash_mesh_get_local_mac(uint8_t mac[6])
 bool keemash_mesh_node_on_control_command(const char *text)
 {
 	return legacy_handle_command(text);
+}
+
+bool keemash_mesh_node_on_control_command_result(const char *text, uint8_t *status,
+                                                 char *result, size_t result_size)
+{
+	if (!text || strcmp(text, "choinka.status") != 0) {
+		return false;
+	}
+
+	s_status_command_exec_count++;
+	if (status) {
+		*status = MESH_V2_CONTROL_STATUS_OK;
+	}
+	if (result && result_size > 0) {
+		uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+		snprintf(result, result_size,
+		         "exec=%lu level=%d pump=%u up=%lu",
+		         (unsigned long)s_status_command_exec_count,
+		         pump_node_get_last_level_percent(),
+		         pump_node_is_pump_on() ? 1U : 0U,
+		         (unsigned long)uptime_s);
+		result[result_size - 1] = '\0';
+	}
+	return true;
 }
 
 void keemash_mesh_node_on_log_ctrl(bool enable)
