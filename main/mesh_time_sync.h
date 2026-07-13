@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "keemash_mesh_proto.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,7 @@ esp_err_t	mesh_time_sync_root_start(uint32_t period_ms);
 
 // RX: call from mesh_rx_task when pkt.type == 2.
 esp_err_t	mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len);
+esp_err_t	mesh_time_sync_apply_v2(const mesh_v2_time_payload_t *time_sync);
 
 #ifdef __cplusplus
 }

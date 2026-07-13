@@ -20,6 +20,7 @@
 
 #include "mesh_proto.h"
 #include "mesh_v2_link.h"
+#include "keemash_mesh_hooks.h"
 
 static const char *TAG = "mesh_log";
 
@@ -125,17 +126,8 @@ esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)packet;
-	data.size = packet_len;
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest));
-
-	esp_err_t err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	const uint8_t root[6] = {0};
+	esp_err_t err = keemash_mesh_transport_send(root, packet, packet_len);
 	record_send_result(err);
 	if (err != ESP_OK &&
 	    (last_warn_ms == 0 || (uint32_t)(now - last_warn_ms) >= 5000U)) {
@@ -145,6 +137,11 @@ esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len
 	return err;
 }
 
+bool mesh_log_stream_transport_ready(void)
+{
+	return mesh_connected_snapshot();
+}
+
 static esp_err_t send_nodeinfo_to_root(void)
 {
 	if (!mesh_connected_snapshot()) {
@@ -152,7 +149,11 @@ static esp_err_t send_nodeinfo_to_root(void)
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	(void)mesh_v2_node_send_nodeinfo();
+	esp_err_t v2_err = mesh_v2_node_send_nodeinfo();
+#if !CONFIG_KEEMASH_V2_COMPAT_TUNNEL_ENABLE
+	record_send_result(v2_err);
+	return v2_err;
+#endif
 
 	mesh_nodeinfo_v2_packet_t p;
 	memset(&p, 0, sizeof(p));
@@ -167,19 +168,10 @@ static esp_err_t send_nodeinfo_to_root(void)
 	p.tag[sizeof(p.tag) - 1] = '\0';
 	p.uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)&p;
-	data.size = sizeof(p);
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest)); // root
-
 	// Keep V1 NODEINFO alive as a compatibility beacon. It makes the node
 	// visible even while V2 is recovering after a root reboot.
-	esp_err_t err = esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	const uint8_t root[6] = {0};
+	esp_err_t err = keemash_mesh_transport_send(root, &p, sizeof(p));
 	record_send_result(err);
 	return err;
 }
@@ -190,9 +182,14 @@ static void send_logline_to_root(const char *line)
 	if (!mesh_connected_snapshot()) return;
 
 #if CONFIG_CHOINKA_V2_LOG_TUNNEL_ENABLE
-	if (mesh_v2_node_send_log_line(line) == ESP_OK) {
+	esp_err_t v2_err = mesh_v2_node_send_log_line(line);
+	if (v2_err == ESP_OK) {
 		return;
 	}
+#if !CONFIG_KEEMASH_V2_COMPAT_TUNNEL_ENABLE
+	record_send_result(v2_err);
+	return;
+#endif
 #else
 	mesh_v2_node_kick_root();
 #endif
@@ -213,17 +210,8 @@ static void send_logline_to_root(const char *line)
 	strncpy(p.line, line, sizeof(p.line) - 1);
 	p.line[sizeof(p.line) - 1] = '\0';
 
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)&p;
-	data.size = sizeof(p);
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest)); // root
-
-	record_send_result(esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0));
+	const uint8_t root[6] = {0};
+	record_send_result(keemash_mesh_transport_send(root, &p, sizeof(p)));
 }
 
 static void send_stream_status_to_root(bool enabled)

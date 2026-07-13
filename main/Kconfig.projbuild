@@ -106,6 +106,13 @@ menu "Example Configuration"
             Limits choinka to layer 2 as a temporary recovery/stabilization
             mode. Keep disabled for V2 tunnel and chained mesh testing.
 
+    config CHOINKA_MESH_RELAY_ELIGIBLE
+        bool "Advertise ESP-MESH relay eligibility"
+        default y
+        help
+            Advertises that this firmware permits ESP-MESH child routing.
+            It does not claim a separate application hop-by-hop transport.
+
     config CHOINKA_DIRECT_MAX_LAYER
         int "Emergency direct-root max layer"
         depends on CHOINKA_DIRECT_ROOT_ONLY
@@ -116,11 +123,10 @@ menu "Example Configuration"
 
     config CHOINKA_V2_LOG_TUNNEL_ENABLE
         bool "Send log lines through V2 tunnel"
-        default n
+        default y
         help
-            Keep disabled during the stabilization pass. NODEINFO, HELLO and
-            TOPOLOGY still use V2, while remote log lines use the older V1
-            stream path so log traffic cannot destabilize V2 recovery.
+            Send remote log lines through the typed reliable V2 channel.
+            Disable only for an explicit compatibility diagnostic build.
 
     config CHOINKA_PSRAM_EXPECTED_BYTES
         int "Expected PSRAM capacity in bytes"

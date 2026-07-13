@@ -19,6 +19,7 @@ void mesh_log_stream_on_mesh_disconnected(void);
 
 // Shared mesh send gate for node-to-root binary packets.
 esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len);
+bool mesh_log_stream_transport_ready(void);
 
 // Best-effort immediate NODEINFO beacon used by recovery watchdogs.
 esp_err_t mesh_log_stream_send_nodeinfo_now(void);

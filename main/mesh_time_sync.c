@@ -13,6 +13,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "mesh_v2_link.h"
+
 static const char *TAG = "mesh_time";
 
 // Must match the legacy mesh_packet_t wire layout.
@@ -110,7 +112,8 @@ static esp_err_t root_send_time_to_all(int64_t epoch_sec, uint32_t seq)
 
 	esp_err_t last_err = ESP_OK;
 	for (int i = 0; i < route_table_size; i++) {
-		esp_err_t e = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
+		esp_err_t e = mesh_v2_link_send(route_table[i].addr, data.data, data.size,
+					     KEEMASH_REL_PRIORITY_NORMAL);
 		if (e != ESP_OK) last_err = e;
 	}
 	return last_err;
@@ -204,5 +207,22 @@ esp_err_t mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len)
 	s_last_rx_seq = tp.seq;
 
 	ESP_LOGI(TAG, "TIME RX seq=%" PRIu32 " set epoch=%" PRId64, tp.seq, tp.epoch_sec);
+	return ESP_OK;
+}
+
+esp_err_t mesh_time_sync_apply_v2(const mesh_v2_time_payload_t *time_sync)
+{
+	if (!time_sync || time_sync->epoch_sec <= TIME_VALID_EPOCH ||
+	    time_sync->generation == 0) return ESP_ERR_INVALID_ARG;
+	if (s_have_time && time_sync->generation <= s_last_rx_seq) return ESP_OK;
+	struct timeval tv = {
+		.tv_sec = (time_t)time_sync->epoch_sec,
+		.tv_usec = 0,
+	};
+	settimeofday(&tv, NULL);
+	s_have_time = true;
+	s_last_rx_seq = time_sync->generation;
+	ESP_LOGI(TAG, "TIME V2 RX generation=%" PRIu32 " epoch=%" PRId64,
+	         time_sync->generation, time_sync->epoch_sec);
 	return ESP_OK;
 }

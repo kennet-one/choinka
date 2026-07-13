@@ -27,6 +27,7 @@
 #include "mesh_log_stream.h"
 #include "mesh_ota_receiver.h"
 #include "mesh_v2_link.h"
+#include "keemash_mesh_hooks.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Constants / globals                                                       */
@@ -502,17 +503,8 @@ static esp_err_t send_reboot_status(uint16_t seq, uint8_t code, const char *msg)
 		p.message[sizeof(p.message) - 1] = '\0';
 	}
 
-	mesh_data_t data;
-	memset(&data, 0, sizeof(data));
-	data.data = (uint8_t *)&p;
-	data.size = sizeof(p);
-	data.proto = MESH_PROTO_BIN;
-	data.tos = MESH_TOS_P2P;
-
-	mesh_addr_t dest;
-	memset(&dest, 0, sizeof(dest));
-
-	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
+	const uint8_t root[6] = {0};
+	return keemash_mesh_transport_send(root, &p, sizeof(p));
 }
 
 static void manual_reboot_task(void *arg)
@@ -526,6 +518,22 @@ static void manual_reboot_task(void *arg)
 
 	vTaskDelay(pdMS_TO_TICKS(delay_ms));
 	esp_restart();
+}
+
+esp_err_t mesh_manual_reboot_schedule(uint16_t delay_ms, const char *reason)
+{
+	if (s_manual_reboot_pending) return ESP_ERR_INVALID_STATE;
+	if (delay_ms < MANUAL_REBOOT_DELAY_MIN_MS ||
+	    delay_ms > MANUAL_REBOOT_DELAY_MAX_MS) delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
+	s_manual_reboot_pending = true;
+	s_manual_reboot_delay_ms = delay_ms;
+	if (xTaskCreate(manual_reboot_task, "manual_reboot", 2048, NULL, 6, NULL) != pdPASS) {
+		s_manual_reboot_pending = false;
+		return ESP_ERR_NO_MEM;
+	}
+	ESP_LOGW(MESH_TAG, "manual reboot scheduled delay=%u reason=%s",
+	         (unsigned)delay_ms, reason && reason[0] ? reason : "none");
+	return ESP_OK;
 }
 
 static void handle_reboot_request(const mesh_reboot_request_packet_t *p,
@@ -552,21 +560,12 @@ static void handle_reboot_request(const mesh_reboot_request_packet_t *p,
 		delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
 	}
 
-	s_manual_reboot_pending = true;
-	s_manual_reboot_delay_ms = delay_ms;
-
-	BaseType_t task_ok = xTaskCreate(manual_reboot_task, "manual_reboot",
-	                                 2048, NULL, 6, NULL);
-	if (task_ok != pdPASS) {
-		s_manual_reboot_pending = false;
+	esp_err_t reboot_err = mesh_manual_reboot_schedule(delay_ms, reason);
+	if (reboot_err != ESP_OK) {
 		(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_ERROR,
 		                         "reboot task failed");
 		return;
 	}
-
-	ESP_LOGW(MESH_TAG, "manual reboot requested: seq=%u delay=%u reason=%s",
-	         (unsigned)p->seq, (unsigned)delay_ms,
-	         reason[0] ? reason : "none");
 	(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_OK,
 	                         "manual reboot accepted");
 }
@@ -616,15 +615,24 @@ static void mesh_rx_task(void *arg)
 		if (h->magic == MESH_PKT_MAGIC && h->version == MESH_PKT_VERSION_V2) {
 			if (data.size >= sizeof(mesh_v2_hdr_t)) {
 				const mesh_v2_hdr_t *v2 = (const mesh_v2_hdr_t *)rx_buf;
-				note_root_rx_from_v2(v2);
+				esp_err_t v2_err = mesh_v2_node_handle_rx(from.addr, rx_buf, data.size);
+				if (v2_err == ESP_OK) note_root_rx_from_v2(v2);
+			} else {
+				ESP_LOGW(MESH_TAG, "RX V2 short: %d bytes", (int)data.size);
 			}
-			mesh_v2_node_handle_rx(rx_buf, data.size);
 			continue;
 		}
 
 		// Not our protocol; ignore it.
 		if (h->magic != MESH_PKT_MAGIC || h->version != MESH_PKT_VERSION) {
 			ESP_LOGW(MESH_TAG, "RX unknown packet from " MACSTR " (%d bytes)", MAC2STR(from.addr), (int)data.size);
+			continue;
+		}
+		uint8_t protocol_root[6] = {0};
+		if (mesh_v2_node_get_root_mac(protocol_root) &&
+		    !mac_equal(from.addr, protocol_root)) {
+			ESP_LOGW(MESH_TAG, "reject V1 packet from non-root " MACSTR,
+			         MAC2STR(from.addr));
 			continue;
 		}
 		note_root_rx_from_v1(h);
@@ -1205,6 +1213,9 @@ static void mesh_event_handler(void *arg,
 		mesh_event_root_address_t *ra =
 		    (mesh_event_root_address_t *)event_data;
 		memcpy(mesh_root_addr, ra->addr, sizeof(mesh_root_addr));
+		// ROOT_ADDRESS is the root SoftAP MAC; reliable packets originate
+		// from its STA MAC, which is bound from the first valid HELLO_ACK.
+		mesh_v2_node_set_root_mac(NULL);
 		ESP_LOGI(MESH_TAG,
 		         "<MESH_EVENT_ROOT_ADDRESS> root:" MACSTR,
 		         MAC2STR(ra->addr));
@@ -1294,6 +1305,7 @@ void app_main(void)
 	mesh_time_sync_init();
 	log_time_vprintf_start();
 	mesh_v2_link_require();
+	mesh_v2_node_set_relay_eligible(CONFIG_CHOINKA_MESH_RELAY_ELIGIBLE);
 	mesh_v2_node_init(MESH_TAG);
 	mesh_log_stream_init(MESH_TAG);
 	ESP_ERROR_CHECK(mesh_ota_receiver_start());
