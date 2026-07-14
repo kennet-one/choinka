@@ -5,4 +5,3 @@
 #define mesh_ota_receiver_start keemash_mesh_ota_receiver_start
 #define mesh_ota_receiver_active keemash_mesh_ota_receiver_active
 #define mesh_ota_receiver_handle_rx keemash_mesh_ota_receiver_handle_rx
-#define mesh_ota_receiver_handle_v2 keemash_mesh_ota_receiver_handle_v2

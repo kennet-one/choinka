@@ -1,39 +1,19 @@
 #pragma once
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include "keemash_mesh_log_stream.h"
 
-#include "esp_err.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// Call once during startup, after log_time_vprintf_start().
-void mesh_log_stream_init(const char *tag);
-
-// Call when the node is actually connected to mesh (PARENT_CONNECTED).
-void mesh_log_stream_on_mesh_connected(void);
-void mesh_log_stream_on_mesh_disconnected(void);
-
-// Shared mesh send gate for node-to-root binary packets.
-esp_err_t mesh_log_stream_send_bin_to_root(const void *packet, size_t packet_len);
-bool mesh_log_stream_transport_ready(void);
-
-// Best-effort immediate NODEINFO beacon used by recovery watchdogs.
-esp_err_t mesh_log_stream_send_nodeinfo_now(void);
-void mesh_log_stream_kick_nodeinfo_burst(void);
-esp_err_t mesh_log_stream_last_send_err(void);
-/* Legacy name: this is local TX-accepted age, not proof that root received it. */
-uint32_t mesh_log_stream_root_ok_age_ms(void);
-bool mesh_log_stream_root_ok_fresh(uint32_t max_age_ms);
-void mesh_log_stream_clear_root_ok(void);
-bool mesh_log_stream_enabled(void);
-
-// Call from mesh_rx_task() when MESH_LOG_TYPE_CTRL is received.
-esp_err_t mesh_log_stream_handle_rx(const void *pkt_buf, size_t pkt_len);
-
-#ifdef __cplusplus
-}
-#endif
+// Transitional aliases keep the proven application/recovery code small while
+// the reusable implementation lives entirely in keemash_mesh_core.
+#define mesh_log_stream_init keemash_mesh_log_stream_init
+#define mesh_log_stream_on_mesh_connected keemash_mesh_log_stream_on_mesh_connected
+#define mesh_log_stream_on_mesh_disconnected keemash_mesh_log_stream_on_mesh_disconnected
+#define mesh_log_stream_send_bin_to_root keemash_mesh_log_stream_send_bin_to_root
+#define mesh_log_stream_transport_ready keemash_mesh_log_stream_transport_ready
+#define mesh_log_stream_send_nodeinfo_now keemash_mesh_log_stream_send_nodeinfo_now
+#define mesh_log_stream_kick_nodeinfo_burst keemash_mesh_log_stream_kick_nodeinfo_burst
+#define mesh_log_stream_last_send_err keemash_mesh_log_stream_last_send_err
+#define mesh_log_stream_tx_accepted_age_ms keemash_mesh_log_stream_tx_accepted_age_ms
+#define mesh_log_stream_tx_accepted_fresh keemash_mesh_log_stream_tx_accepted_fresh
+#define mesh_log_stream_clear_tx_accepted keemash_mesh_log_stream_clear_tx_accepted
+#define mesh_log_stream_enabled keemash_mesh_log_stream_enabled
+#define mesh_log_stream_handle_rx keemash_mesh_log_stream_handle_v1_ctrl

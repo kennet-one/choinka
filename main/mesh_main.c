@@ -294,7 +294,7 @@ static void diag_note_ack_stale(uint32_t now)
 {
 	s_ack_stale_count++;
 	if (mesh_log_stream_last_send_err() == ESP_OK &&
-	    mesh_log_stream_root_ok_fresh(ROOT_ACK_FRESH_MS)) {
+	    mesh_log_stream_tx_accepted_fresh(ROOT_ACK_FRESH_MS)) {
 		s_tx_without_ack_count++;
 		diag_note_recovery_reason(now, MESH_V2_RECOVERY_REASON_TX_NO_ACK);
 	} else {
@@ -307,7 +307,7 @@ static void sync_v2_diagnostics(void)
 	bool ack_health = root_ack_health_fresh();
 	bool tx_without_ack = !ack_health &&
 	                       mesh_log_stream_last_send_err() == ESP_OK &&
-	                       mesh_log_stream_root_ok_fresh(ROOT_ACK_FRESH_MS);
+	                       mesh_log_stream_tx_accepted_fresh(ROOT_ACK_FRESH_MS);
 	mesh_v2_node_diag_t diag = {
 		.boot_seq = s_boot_seq,
 		.last_recovery_action_ms = s_last_recovery_action_ms,
@@ -390,7 +390,7 @@ static void note_mesh_disconnected(void)
 	is_mesh_connected = false;
 	s_root_recovery_phase = ROOT_RECOVERY_OK;
 	mesh_v2_node_set_recovery_phase((uint8_t)ROOT_RECOVERY_OK);
-	mesh_log_stream_clear_root_ok();
+	mesh_log_stream_clear_tx_accepted();
 	s_root_unhealthy_since_ms = 0;
 	s_last_root_burst_ms = 0;
 	s_last_root_rx_ms = 0;
@@ -433,7 +433,7 @@ static void root_recovery_reset_ok(uint32_t now)
 		         (unsigned long)down_ms,
 		         (unsigned long)mesh_v2_node_ack_age_ms(),
 		         (unsigned long)root_rx_age_ms(),
-		         (unsigned long)mesh_log_stream_root_ok_age_ms());
+		         (unsigned long)mesh_log_stream_tx_accepted_age_ms());
 	}
 	s_root_recovery_phase = ROOT_RECOVERY_OK;
 	mesh_v2_node_set_recovery_phase((uint8_t)ROOT_RECOVERY_OK);
@@ -465,7 +465,7 @@ static void root_recovery_log_throttled(uint32_t now, uint32_t down_ms,
 	         (unsigned long)down_ms,
 	         (unsigned long)mesh_v2_node_ack_age_ms(),
 	         (unsigned long)root_rx_age_ms(),
-	         (unsigned long)mesh_log_stream_root_ok_age_ms(),
+	         (unsigned long)mesh_log_stream_tx_accepted_age_ms(),
 	         esp_err_to_name(last_err),
 	         action ? action : "watch");
 }
@@ -855,7 +855,8 @@ static esp_err_t mesh_platform_init_and_start(void)
 		mesh_v2_link_require();
 		mesh_v2_node_set_relay_eligible(CONFIG_CHOINKA_MESH_RELAY_ELIGIBLE);
 		mesh_v2_node_init(MESH_TAG);
-		mesh_log_stream_init(MESH_TAG);
+		err = mesh_log_stream_init(MESH_TAG);
+		if (err != ESP_OK) return err;
 		runtime_ready = true;
 	}
 	if (!ota_receiver_ready) {
@@ -1346,7 +1347,7 @@ static void mesh_event_handler(void *arg,
 			uint32_t now = tick_ms();
 			s_rootless_count++;
 			diag_note_recovery_reason(now, MESH_V2_RECOVERY_REASON_ROOTLESS);
-			mesh_log_stream_clear_root_ok();
+			mesh_log_stream_clear_tx_accepted();
 			if (s_root_unhealthy_since_ms == 0) {
 				s_root_unhealthy_since_ms = now;
 			}

@@ -1,26 +1,11 @@
 #pragma once
 
-#include <stddef.h>
-#include <stdint.h>
-#include "esp_err.h"
-#include "keemash_mesh_proto.h"
+#include "keemash_mesh_time.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#define mesh_time_sync_handle_rx keemash_mesh_time_handle_v1
+#define mesh_time_sync_apply_v2 keemash_mesh_time_apply_v2
 
-// TIME packets use legacy type=2.
-#define MESH_TIME_SYNC_TYPE_TIME	2
-
-void		mesh_time_sync_init(void);
-
-// Root: start the task that sends time to mesh nodes every period_ms.
-esp_err_t	mesh_time_sync_root_start(uint32_t period_ms);
-
-// RX: call from mesh_rx_task when pkt.type == 2.
-esp_err_t	mesh_time_sync_handle_rx(const void *pkt_buf, size_t pkt_len);
-esp_err_t	mesh_time_sync_apply_v2(const mesh_v2_time_payload_t *time_sync);
-
-#ifdef __cplusplus
+static inline void mesh_time_sync_init(void)
+{
+	keemash_mesh_time_init("CET-1CEST,M3.5.0/2,M10.5.0/3");
 }
-#endif

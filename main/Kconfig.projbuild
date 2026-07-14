@@ -121,22 +121,6 @@ menu "Example Configuration"
         help
             Max layer used when CHOINKA_DIRECT_ROOT_ONLY is enabled.
 
-    config CHOINKA_V2_LOG_TUNNEL_ENABLE
-        bool "Send log lines through V2 tunnel"
-        default y
-        help
-            Send remote log lines through the typed reliable V2 channel.
-            Disable only for an explicit compatibility diagnostic build.
-
-    config CHOINKA_PSRAM_EXPECTED_BYTES
-        int "Expected PSRAM capacity in bytes"
-        range 0 33554432
-        default 0
-        help
-            Optional board note for diagnostics when runtime PSRAM is inactive
-            or not detected. If PSRAM is detected and initialized, telemetry
-            uses the measured PSRAM heap size instead.
-
     menu "Choinka pump controller"
 
         config CHOINKA_PUMP_ACTIVE_HIGH

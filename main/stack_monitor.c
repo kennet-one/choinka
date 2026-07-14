@@ -48,7 +48,7 @@ static void log_ram_snapshot(void)
 			(unsigned)psram_free_bytes,
 			(unsigned)psram_min_free_bytes,
 			(unsigned)psram_total_bytes,
-			(unsigned)CONFIG_CHOINKA_PSRAM_EXPECTED_BYTES);
+			(unsigned)CONFIG_KEEMASH_NODE_PSRAM_EXPECTED_BYTES);
 }
 
 static void log_flash_snapshot(void)
