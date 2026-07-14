@@ -77,6 +77,7 @@ static uint32_t   s_disconnected_since_ms = 0;
 static uint32_t   s_last_reconnect_attempt_ms = 0;
 static uint32_t   s_last_mesh_restart_ms = 0;
 static TaskHandle_t s_mesh_reconnect_task = NULL;
+static bool s_mesh_library_initialized = false;
 static volatile bool s_mesh_service_started = false;
 
 typedef enum {
@@ -713,12 +714,11 @@ static esp_err_t mesh_comm_start(void)
 
 static esp_err_t mesh_service_init_and_start(void)
 {
-	static bool mesh_library_initialized = false;
 	esp_err_t err = ESP_OK;
-	if (!mesh_library_initialized) {
+	if (!s_mesh_library_initialized) {
 		err = esp_mesh_init();
 		if (err != ESP_OK) return err;
-		mesh_library_initialized = true;
+		s_mesh_library_initialized = true;
 	}
 
 	err = esp_mesh_fix_root(false);
@@ -955,6 +955,7 @@ static bool mesh_service_recovery_step(uint32_t now)
 		s_mesh_service_action_ms = now;
 		esp_err_t err = esp_mesh_start();
 		if (err == ESP_ERR_MESH_NOT_INIT) {
+			s_mesh_library_initialized = false;
 			err = mesh_service_init_and_start();
 		}
 		diag_note_send_err(err);
@@ -1094,6 +1095,24 @@ static void mesh_reconnect_watchdog_task(void *arg)
 		}
 
 		uint32_t down_ms = (uint32_t)(now - s_disconnected_since_ms);
+		if (down_ms >= MESH_RECONNECT_HARD_MS &&
+		    (uint32_t)(now - s_last_mesh_restart_ms) >= MESH_RECONNECT_HARD_MS) {
+			s_last_mesh_restart_ms = now;
+			s_last_reconnect_attempt_ms = now;
+			s_mesh_restart_count++;
+			s_last_recovery_reason = MESH_V2_RECOVERY_REASON_MESH_RESTART;
+			diag_note_recovery_action(now, ESP_OK);
+			ESP_LOGW(MESH_TAG,
+			         "mesh reconnect watchdog: no parent for %lu ms, restarting mesh service",
+			         (unsigned long)down_ms);
+
+			mesh_v2_node_on_mesh_disconnected();
+			mesh_log_stream_on_mesh_disconnected();
+			note_mesh_disconnected();
+			(void)mesh_service_request_restart(now);
+			continue;
+		}
+
 		if (down_ms >= MESH_RECONNECT_SOFT_MS &&
 		    (uint32_t)(now - s_last_reconnect_attempt_ms) >= MESH_RECONNECT_SOFT_MS) {
 			s_last_reconnect_attempt_ms = now;
@@ -1117,23 +1136,6 @@ static void mesh_reconnect_watchdog_task(void *arg)
 				         "mesh reconnect watchdog: esp_mesh_connect failed: %s",
 				         esp_err_to_name(err));
 			}
-		}
-
-		if (down_ms >= MESH_RECONNECT_HARD_MS &&
-		    (uint32_t)(now - s_last_mesh_restart_ms) >= MESH_RECONNECT_HARD_MS) {
-			s_last_mesh_restart_ms = now;
-			s_last_reconnect_attempt_ms = now;
-			s_mesh_restart_count++;
-			s_last_recovery_reason = MESH_V2_RECOVERY_REASON_MESH_RESTART;
-			diag_note_recovery_action(now, ESP_OK);
-			ESP_LOGW(MESH_TAG,
-			         "mesh reconnect watchdog: no parent for %lu ms, restarting mesh service",
-			         (unsigned long)down_ms);
-
-			mesh_v2_node_on_mesh_disconnected();
-			mesh_log_stream_on_mesh_disconnected();
-			note_mesh_disconnected();
-			(void)mesh_service_request_restart(now);
 		}
 	}
 }
