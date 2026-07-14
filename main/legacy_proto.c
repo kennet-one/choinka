@@ -1,142 +1,51 @@
 #include "legacy_proto.h"
-#include "esp_log.h"
+
 #include <string.h>
-#include <stdlib.h>	// atof
 
-static const char *LEG_TAG = "legacy";
+#include "esp_log.h"
 
-/**
- * Прості хелпери для порівняння рядків
- */
-static bool streq(const char *a, const char *b)
+static const char *TAG = "legacy";
+
+static bool starts_with(const char *text, const char *prefix)
 {
-	if (!a || !b) return false;
-	return strcmp(a, b) == 0;
+	return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
 }
 
-static bool starts_with(const char *s, const char *prefix)
+bool legacy_is_sensor_value(const char *message)
 {
-	if (!s || !prefix) return false;
-	size_t l = strlen(prefix);
-	return strncmp(s, prefix, l) == 0;
+	return starts_with(message, "TDSB") || starts_with(message, "TDS") ||
+	       starts_with(message, "ttds");
 }
 
-bool legacy_is_sensor_value(const char *msg)
+bool legacy_handle_command(const char *message)
 {
-	if (!msg || !msg[0]) return false;
+	if (!message) {
+		return false;
+	}
 
-	// старі формати: "TDSB123", "TDS456", "ttds25" і т.п.
-	if (starts_with(msg, "TDSB")) return true;
-	if (starts_with(msg, "TDS"))  return true;
-	if (starts_with(msg, "ttds")) return true;
-
-	return false;
-}
-
-bool legacy_handle_command(const char *msg)
-{
-	if (!msg) return false;
-
-	// зробимо копію, щоб трохи “почистити” (trim)
-	char buf[64];
-	strncpy(buf, msg, sizeof(buf) - 1);
-	buf[sizeof(buf) - 1] = '\0';
-
-	// прибираємо пробіли з кінця
-	for (int i = strlen(buf) - 1; i >= 0; --i) {
-		if (buf[i] == ' ' || buf[i] == '\r' || buf[i] == '\n' || buf[i] == '\t') {
-			buf[i] = '\0';
-		} else {
+	char text[64];
+	strncpy(text, message, sizeof(text) - 1);
+	text[sizeof(text) - 1] = '\0';
+	for (size_t length = strlen(text); length > 0; --length) {
+		char c = text[length - 1];
+		if (c != ' ' && c != '\r' && c != '\n' && c != '\t') {
 			break;
 		}
+		text[length - 1] = '\0';
+	}
+	if (text[0] == '\0') {
+		return false;
 	}
 
-	if (!buf[0]) return false;
-
-	// ---- 1) Команди типу "readtds", "pm1", "pomp", "140" ... ----
-	if (streq(buf, "readtds")) {
-		ESP_LOGI(LEG_TAG, "[CMD] readtds  (тут включиш TDS state-machine)");
-		// TODO: виклик твоєї функції, яка стартує вимір TDS + відправку
-		// start_tds_measurement(true);
-		return true;
-	}
-
-	if (streq(buf, "pm1")) {
-		ESP_LOGI(LEG_TAG, "[CMD] pm1  (старий режим pmm.state = WAKE)");
-		// TODO: виклик твого нового коду, який робить те саме, що старий handleBody("pm1")
-		return true;
-	}
-
-	if (streq(buf, "pomp")) {
-		ESP_LOGI(LEG_TAG, "[CMD] pomp  (включити помпу)");
-		// TODO: relControl.pimp() еквівалент
-		return true;
-	}
-
-	if (streq(buf, "140") ||
-	    streq(buf, "141") ||
-	    streq(buf, "142") ||
-	    streq(buf, "143")) {
-		ESP_LOGI(LEG_TAG, "[CMD] turbo mode = %s", buf);
-		// TODO: виставити ту ж туurbo-логіку, що й раніше
-		return true;
-	}
-
-	if (streq(buf, "flow")) {
-		ESP_LOGI(LEG_TAG, "[CMD] flow");
-		// TODO: relControl.flo();
-		return true;
-	}
-
-	if (streq(buf, "ion")) {
-		ESP_LOGI(LEG_TAG, "[CMD] ion");
-		// TODO: relControl.ionn();
-		return true;
-	}
-
-	if (streq(buf, "echo_turb")) {
-		ESP_LOGI(LEG_TAG, "[CMD] echo_turb");
-		// TODO: eho();
-		return true;
-	}
-
-	if (streq(buf, "huOn")) {
-		ESP_LOGI(LEG_TAG, "[CMD] huOn (power)");
-		// TODO: relControl.power();
-		return true;
-	}
-
-	// ---- 2) Сенсорні значення типу "TDSB123", "TDS456", "ttds25" ----
-	if (starts_with(buf, "TDSB")) {
-		const char *p = buf + 4;
-		float broth_ppm = atof(p);
-		ESP_LOGI(LEG_TAG, "[SENSOR] TDS broth @25°C ≈ %.1f ppm", broth_ppm);
-		// TODO: зберегти кудись broth_ppm
-		return true;
-	}
-
-	if (starts_with(buf, "TDS")) {
-		const char *p = buf + 3;
-		float tds_ppm = atof(p);
-		ESP_LOGI(LEG_TAG, "[SENSOR] TDS@25°C ≈ %.1f ppm", tds_ppm);
-		// TODO: зберегти tds_ppm
-		return true;
-	}
-
-	if (starts_with(buf, "ttds")) {
-		const char *p = buf + 4;
-		float temp_c = atof(p);
-		ESP_LOGI(LEG_TAG, "[SENSOR] temp for TDS ≈ %.2f °C", temp_c);
-		// TODO: зберегти temp_c (калібровка / лог)
-		return true;
-	}
-
-	// ---- 3) Якщо нічого не підійшло ----
-	ESP_LOGW(LEG_TAG, "unknown legacy msg: \"%s\"", buf);
+	/*
+	 * This firmware has no safe legacy actuator contract. Returning false is
+	 * intentional: the reliable control layer must not cache a fake success.
+	 */
+	ESP_LOGW(TAG, "unsupported legacy message: \"%s\"", text);
 	return false;
 }
 
-void legacy_handle_text(const char *msg)
+void legacy_handle_text(const char *message)
 {
-	(void)legacy_handle_command(msg);
+	(void)legacy_handle_command(message);
 }

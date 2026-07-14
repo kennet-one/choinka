@@ -137,6 +137,65 @@ menu "Example Configuration"
             or not detected. If PSRAM is detected and initialized, telemetry
             uses the measured PSRAM heap size instead.
 
+    menu "Choinka pump controller"
+
+        config CHOINKA_PUMP_ACTIVE_HIGH
+            bool "Pump input is active high"
+            default y
+            help
+                GPIO26 HIGH enables the current pump driver. Disable only for
+                hardware with an active-low input.
+
+        config CHOINKA_PUMP_BOOT_PULSE_ENABLE
+            bool "Enable cold-power-on pump pulse"
+            default y
+            help
+                Run the compatibility pump pulse only after ESP_RST_POWERON.
+                OTA, software, watchdog, panic and brownout resets skip it.
+
+        config CHOINKA_PUMP_BOOT_PULSE_MS
+            int "Cold-power-on pulse duration (ms)"
+            depends on CHOINKA_PUMP_BOOT_PULSE_ENABLE
+            range 10 1000
+            default 200
+
+        config CHOINKA_PUMP_CHECK_PERIOD_MS
+            int "Water-level check period (ms)"
+            range 100 10000
+            default 1000
+
+        config CHOINKA_PUMP_MAX_RUN_MS
+            int "Maximum pump run time (ms)"
+            range 100 30000
+            default 3000
+
+        config CHOINKA_PUMP_MIN_PAUSE_MS
+            int "Minimum pause between runs (ms)"
+            range 1000 3600000
+            default 60000
+
+        config CHOINKA_LEVEL_DRY_THRESHOLD_MV
+            int "Dry electrode threshold (mV)"
+            range 0 3300
+            default 1100
+
+        config CHOINKA_LEVEL_WET_THRESHOLD_MV
+            int "Wet electrode threshold (mV)"
+            range 0 3300
+            default 1900
+
+        config CHOINKA_LEVEL_DRY_CONFIRM_CYCLES
+            int "Consecutive dry samples before a run"
+            range 1 20
+            default 3
+
+        config CHOINKA_LEVEL_WET_CONFIRM_CYCLES
+            int "Consecutive wet samples before stopping"
+            range 1 20
+            default 2
+
+    endmenu
+
     config MESH_CHANNEL
         int "channel"
         range 0 14

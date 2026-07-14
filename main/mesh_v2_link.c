@@ -116,18 +116,33 @@ bool keemash_mesh_node_on_control_command_result(const char *text, uint8_t *stat
 		return false;
 	}
 
+	pump_node_status_t pump_status = {0};
+	if (!pump_node_get_status(&pump_status)) {
+		if (status) {
+			*status = MESH_V2_CONTROL_STATUS_FAILED;
+		}
+		if (result && result_size > 0) {
+			snprintf(result, result_size, "pump status unavailable");
+			result[result_size - 1] = '\0';
+		}
+		return true;
+	}
+
 	s_status_command_exec_count++;
 	if (status) {
 		*status = MESH_V2_CONTROL_STATUS_OK;
 	}
 	if (result && result_size > 0) {
-		uint32_t uptime_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
 		snprintf(result, result_size,
-		         "exec=%lu level=%d pump=%u up=%lu",
+		         "exec=%lu level=%s pump=%u mv=%d/%d cal=%u cd=%lu stop=%s tout=%lu",
 		         (unsigned long)s_status_command_exec_count,
-		         pump_node_get_last_level_percent(),
-		         pump_node_is_pump_on() ? 1U : 0U,
-		         (unsigned long)uptime_s);
+		         pump_node_level_name(pump_status.level_state),
+		         pump_status.pump_on ? 1U : 0U,
+		         pump_status.voltage_ab_mv, pump_status.voltage_ba_mv,
+		         pump_status.adc_calibrated ? 1U : 0U,
+		         (unsigned long)pump_status.cooldown_remaining_ms,
+		         pump_node_stop_reason_name(pump_status.last_stop_reason),
+		         (unsigned long)pump_status.timeout_count);
 		result[result_size - 1] = '\0';
 	}
 	return true;

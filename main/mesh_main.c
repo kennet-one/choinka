@@ -713,8 +713,13 @@ static esp_err_t mesh_comm_start(void)
 
 static esp_err_t mesh_service_init_and_start(void)
 {
-	esp_err_t err = esp_mesh_init();
-	if (err != ESP_OK) return err;
+	static bool mesh_library_initialized = false;
+	esp_err_t err = ESP_OK;
+	if (!mesh_library_initialized) {
+		err = esp_mesh_init();
+		if (err != ESP_OK) return err;
+		mesh_library_initialized = true;
+	}
 
 	err = esp_mesh_fix_root(false);
 	if (err != ESP_OK) return err;
@@ -770,6 +775,100 @@ static esp_err_t mesh_service_init_and_start(void)
 		 (unsigned)mesh_max_layer,
 		 (unsigned)CONFIG_CHOINKA_DIRECT_ROOT_ONLY);
 	return esp_mesh_start();
+}
+
+static esp_err_t nvs_init_for_mesh(void)
+{
+	esp_err_t err = nvs_flash_init();
+	if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+	    err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		ESP_LOGW(MESH_TAG, "NVS requires recovery erase: %s",
+			 esp_err_to_name(err));
+		err = nvs_flash_erase();
+		if (err == ESP_OK) {
+			err = nvs_flash_init();
+		}
+	}
+	return err;
+}
+
+static esp_err_t mesh_platform_init_and_start(void)
+{
+	static bool nvs_ready = false;
+	static bool netif_ready = false;
+	static bool event_loop_ready = false;
+	static bool mesh_netifs_ready = false;
+	static bool wifi_ready = false;
+	static bool wifi_storage_ready = false;
+	static bool wifi_started = false;
+	static bool mesh_handler_ready = false;
+	static bool runtime_ready = false;
+	static bool ota_receiver_ready = false;
+	static bool mesh_start_requested = false;
+
+	esp_err_t err;
+	if (!nvs_ready) {
+		err = nvs_init_for_mesh();
+		if (err != ESP_OK) return err;
+		nvs_ready = true;
+	}
+	if (!netif_ready) {
+		err = esp_netif_init();
+		if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+		netif_ready = true;
+	}
+	if (!event_loop_ready) {
+		err = esp_event_loop_create_default();
+		if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+		event_loop_ready = true;
+	}
+	if (!mesh_netifs_ready) {
+		err = esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL);
+		if (err != ESP_OK) return err;
+		mesh_netifs_ready = true;
+	}
+	if (!wifi_ready) {
+		wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+		err = esp_wifi_init(&wifi_config);
+		if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
+		wifi_ready = true;
+	}
+	if (!wifi_storage_ready) {
+		err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+		if (err != ESP_OK) return err;
+		wifi_storage_ready = true;
+	}
+	if (!wifi_started) {
+		err = esp_wifi_start();
+		if (err != ESP_OK) return err;
+		wifi_started = true;
+	}
+	if (!mesh_handler_ready) {
+		err = esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
+					 &mesh_event_handler, NULL);
+		if (err != ESP_OK) return err;
+		mesh_handler_ready = true;
+	}
+	if (!runtime_ready) {
+		mesh_time_sync_init();
+		log_time_vprintf_start();
+		mesh_v2_link_require();
+		mesh_v2_node_set_relay_eligible(CONFIG_CHOINKA_MESH_RELAY_ELIGIBLE);
+		mesh_v2_node_init(MESH_TAG);
+		mesh_log_stream_init(MESH_TAG);
+		runtime_ready = true;
+	}
+	if (!ota_receiver_ready) {
+		err = mesh_ota_receiver_start();
+		if (err != ESP_OK) return err;
+		ota_receiver_ready = true;
+	}
+	if (!mesh_start_requested) {
+		err = mesh_service_init_and_start();
+		if (err != ESP_OK) return err;
+		mesh_start_requested = true;
+	}
+	return ESP_OK;
 }
 
 static esp_err_t mesh_service_request_restart(uint32_t now)
@@ -1282,42 +1381,50 @@ static void mesh_event_handler(void *arg,
 
 void app_main(void)
 {
-	ESP_ERROR_CHECK(nvs_flash_init());
+	const pump_node_pins_t pump_pins = {
+		.level_a_gpio = GPIO_NUM_32,
+		.level_b_gpio = GPIO_NUM_33,
+		.pump_gpio = GPIO_NUM_26,
+	};
+
+	esp_err_t pump_error = pump_node_early_safe_init(pump_pins.pump_gpio);
+	if (pump_error == ESP_OK) {
+		pump_error = pump_node_init(&pump_pins);
+	}
+	if (pump_error == ESP_OK) {
+		pump_error = pump_node_start_task(5);
+	}
+	if (pump_error != ESP_OK) {
+		(void)pump_node_early_safe_init(pump_pins.pump_gpio);
+		ESP_LOGE(MESH_TAG, "autonomous pump startup failed: %s",
+			 esp_err_to_name(pump_error));
+	}
+
 	diag_boot_init();
 	ota_mark_running_app_valid_if_pending();
-	ESP_ERROR_CHECK(esp_netif_init());
-	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-	// Create mesh netifs; keep the STA netif handle.
-	ESP_ERROR_CHECK(
-	    esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
+	uint32_t retry_delay_ms = 1000;
+	esp_err_t mesh_error;
+	while ((mesh_error = mesh_platform_init_and_start()) != ESP_OK) {
+		ESP_LOGE(MESH_TAG,
+			 "mesh platform startup failed: %s; retrying in %lu ms",
+			 esp_err_to_name(mesh_error), (unsigned long)retry_delay_ms);
+		vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+		if (retry_delay_ms < 30000) {
+			retry_delay_ms *= 2;
+			if (retry_delay_ms > 30000) retry_delay_ms = 30000;
+		}
+	}
 
-	// Wi-Fi
-	wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-	ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
-	ESP_ERROR_CHECK(esp_wifi_start());
-
-	// MESH
-	ESP_ERROR_CHECK(
-	    esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID,
-	                               &mesh_event_handler, NULL));
-	mesh_time_sync_init();
-	log_time_vprintf_start();
-	mesh_v2_link_require();
-	mesh_v2_node_set_relay_eligible(CONFIG_CHOINKA_MESH_RELAY_ELIGIBLE);
-	mesh_v2_node_init(MESH_TAG);
-	mesh_log_stream_init(MESH_TAG);
-	ESP_ERROR_CHECK(mesh_ota_receiver_start());
-
-	ESP_ERROR_CHECK(mesh_service_init_and_start());
-	if (!s_mesh_reconnect_task) {
-		xTaskCreate(mesh_reconnect_watchdog_task,
-		            "mesh_reconn",
-		            5120,
-		            NULL,
-		            4,
-		            &s_mesh_reconnect_task);
+	while (!s_mesh_reconnect_task) {
+		BaseType_t created = xTaskCreate(mesh_reconnect_watchdog_task,
+					     "mesh_reconn", 5120, NULL, 4,
+					     &s_mesh_reconnect_task);
+		if (created != pdPASS) {
+			ESP_LOGE(MESH_TAG,
+				 "failed to create mesh reconnect task; retrying in 1000 ms");
+			vTaskDelay(pdMS_TO_TICKS(1000));
+		}
 	}
 
 	ESP_LOGI(MESH_TAG,
@@ -1327,14 +1434,4 @@ void app_main(void)
 	         esp_mesh_get_topology(),
 	         esp_mesh_get_topology() ? "(chain)" : "(tree)",
 	         esp_mesh_is_ps_enabled());
-
-		// -------- Pump node wiring --------
-	pump_node_pins_t pump_pins = {
-		.level_a_gpio = GPIO_NUM_32,   // LEVEL_A_PIN
-		.level_b_gpio = GPIO_NUM_33,   // LEVEL_B_PIN
-		.pump_gpio    = GPIO_NUM_26,   // PUMP_PIN
-	};
-
-	ESP_ERROR_CHECK(pump_node_init(&pump_pins));
-	pump_node_start_task(5);
 }

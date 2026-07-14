@@ -1,474 +1,436 @@
 #include "pump_node.h"
 
-#include <math.h>
-#include <string.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
+#include <inttypes.h>
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_adc/adc_oneshot.h"
-#include "driver/gpio.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "pump_controller_selftest.h"
+#include "pump_driver.h"
+#include "sdkconfig.h"
+#include "water_level_sensor.h"
 
-// adc калібрація
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
-// adc калібрація
+#ifndef CONFIG_CHOINKA_PUMP_ACTIVE_HIGH
+#define CONFIG_CHOINKA_PUMP_ACTIVE_HIGH 0
+#endif
+#ifndef CONFIG_CHOINKA_PUMP_BOOT_PULSE_ENABLE
+#define CONFIG_CHOINKA_PUMP_BOOT_PULSE_ENABLE 0
+#endif
+#ifndef CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS
+#define CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS 200
+#endif
+#ifndef CONFIG_CHOINKA_PUMP_CHECK_PERIOD_MS
+#define CONFIG_CHOINKA_PUMP_CHECK_PERIOD_MS 1000
+#endif
+#ifndef CONFIG_CHOINKA_PUMP_MAX_RUN_MS
+#define CONFIG_CHOINKA_PUMP_MAX_RUN_MS 3000
+#endif
+#ifndef CONFIG_CHOINKA_PUMP_MIN_PAUSE_MS
+#define CONFIG_CHOINKA_PUMP_MIN_PAUSE_MS 60000
+#endif
+#ifndef CONFIG_CHOINKA_LEVEL_DRY_THRESHOLD_MV
+#define CONFIG_CHOINKA_LEVEL_DRY_THRESHOLD_MV 1100
+#endif
+#ifndef CONFIG_CHOINKA_LEVEL_WET_THRESHOLD_MV
+#define CONFIG_CHOINKA_LEVEL_WET_THRESHOLD_MV 1900
+#endif
+#ifndef CONFIG_CHOINKA_LEVEL_DRY_CONFIRM_CYCLES
+#define CONFIG_CHOINKA_LEVEL_DRY_CONFIRM_CYCLES 3
+#endif
+#ifndef CONFIG_CHOINKA_LEVEL_WET_CONFIRM_CYCLES
+#define CONFIG_CHOINKA_LEVEL_WET_CONFIRM_CYCLES 2
+#endif
 
-/* -------------------------------------------------------------------------- */
-/*  Константи                                                                 */
-/* -------------------------------------------------------------------------- */
+#define PUMP_SUMMARY_PERIOD_MS 15000U
 
 static const char *TAG = "pump_node";
 
-/* таймінги й пороги  */
-
-#define CHECK_PERIOD_MS			1000UL		// раз на секунду
-#define MAX_PUMP_TIME_MS		3000UL		// помпа максимум 3 c
-#define MIN_PAUSE_MS			60000UL		// 1 хв пауза між поливами
-
-#define DRY_VOLTAGE				1.10f		// нижче ≈ сухо
-#define WET_VOLTAGE				1.90f		// вище ≈ точно вода
-
-#define DRY_CONFIRM_CYCLES		3			// скільки разів підряд "сухо"
-#define WET_CONFIRM_CYCLES		2			// скільки разів підряд "мокро"
-
-#define ADC_VREF				3.3f
-#define ADC_MAX_RAW				4095.0f		// 12-біт
-
-/* Для класичного ESP32: GPIO32->ADC1_CH4, GPIO33->ADC1_CH5 */
-#define PUMP_ADC_UNIT			ADC_UNIT_1
-#define LEVEL_A_CHANNEL			ADC_CHANNEL_4	// GPIO32
-#define LEVEL_B_CHANNEL			ADC_CHANNEL_5	// GPIO33
-
-#ifndef ADC_ATTEN_DB_11
-#define ADC_ATTEN_DB_11 ADC_ATTEN_DB_12
-#endif
-
-/* -------------------------------------------------------------------------- */
-/*  Типи / глобальний контекст                                               */
-/* -------------------------------------------------------------------------- */
-
-typedef enum {
-	WATER_DRY = 0,
-	WATER_WET,
-	WATER_UNKNOWN
-} water_state_t;
-
 typedef struct {
-	gpio_num_t	level_a_gpio;
-	gpio_num_t	level_b_gpio;
-	gpio_num_t	pump_gpio;
+	bool initialized;
+	pump_node_pins_t pins;
+	pump_controller_t controller;
+	pump_node_status_t status;
+	SemaphoreHandle_t status_mutex;
+	TaskHandle_t task;
+	esp_timer_handle_t safety_timer;
+	portMUX_TYPE safety_lock;
+	bool safety_timeout_pending;
+	esp_err_t safety_driver_error;
+} pump_node_context_t;
 
-	bool		inited;
+static pump_node_context_t s_pump = {
+	.safety_lock = portMUX_INITIALIZER_UNLOCKED,
+};
 
-	// стан помпи
-	bool		pump_on;
-	uint32_t	pump_start_ms;
-	uint32_t	last_water_ms;
-
-	// гістерезис рівня
-	bool		stored_is_full;
-	uint8_t		dry_streak;
-	uint8_t		wet_streak;
-
-	int			last_level_percent;
-} pump_ctx_t;
-
-static pump_ctx_t					s_pump;
-static adc_oneshot_unit_handle_t	s_adc = NULL;
-
-// adc калібрація
-static adc_cali_handle_t	s_adc_cali = NULL;
-static bool					s_adc_cal_ok = false;
-// adc калібрація
-
-/* -------------------------------------------------------------------------- */
-/*  Хелпери часу / класифікації                                              */
-/* -------------------------------------------------------------------------- */
-
-static inline uint32_t now_ms(void)
+static void cleanup_partial_runtime(void)
 {
-	return (uint32_t)(esp_timer_get_time() / 1000ULL);
+	(void)pump_driver_set(false);
+	if (s_pump.safety_timer) {
+		(void)esp_timer_stop(s_pump.safety_timer);
+		(void)esp_timer_delete(s_pump.safety_timer);
+		s_pump.safety_timer = NULL;
+	}
+	if (s_pump.status_mutex) {
+		vSemaphoreDelete(s_pump.status_mutex);
+		s_pump.status_mutex = NULL;
+	}
 }
 
-static water_state_t classify_voltage(float u)
+static uint64_t now_ms(void)
 {
-	if (isnan(u)) {
-		return WATER_UNKNOWN;
-	}
-	if (u >= WET_VOLTAGE) {
-		return WATER_WET;
-	}
-	if (u <= DRY_VOLTAGE) {
-		return WATER_DRY;
-	}
-	return WATER_UNKNOWN;
+	return (uint64_t)esp_timer_get_time() / 1000ULL;
 }
 
-// adc калібрація
-static void adc_try_init_calibration(void)
+const char *pump_node_level_name(pump_level_state_t state)
 {
-	s_adc_cali = NULL;
-	s_adc_cal_ok = false;
+	switch (state) {
+	case PUMP_LEVEL_DRY:
+		return "dry";
+	case PUMP_LEVEL_WET:
+		return "wet";
+	default:
+		return "unknown";
+	}
+}
 
-	#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-	{
-		adc_cali_curve_fitting_config_t cal_cfg =
-		{
-			.unit_id = PUMP_ADC_UNIT,
-			.atten = ADC_ATTEN_DB_11,
-			.bitwidth = ADC_BITWIDTH_12,
-		};
+const char *pump_node_stop_reason_name(pump_stop_reason_t reason)
+{
+	switch (reason) {
+	case PUMP_STOP_BOOT_PULSE:
+		return "boot_pulse";
+	case PUMP_STOP_LEVEL_WET:
+		return "level_wet";
+	case PUMP_STOP_SENSOR_UNKNOWN:
+		return "sensor_unknown";
+	case PUMP_STOP_SAFETY_TIMEOUT:
+		return "safety_timeout";
+	case PUMP_STOP_DRIVER_ERROR:
+		return "driver_error";
+	default:
+		return "none";
+	}
+}
 
-		if(adc_cali_create_scheme_curve_fitting(&cal_cfg, &s_adc_cali) == ESP_OK)
-		{
-			s_adc_cal_ok = true;
-			ESP_LOGI(TAG, "ADC calibration: curve fitting OK");
-			return;
+esp_err_t pump_node_early_safe_init(gpio_num_t pump_gpio)
+{
+	esp_err_t err = pump_driver_init(pump_gpio,
+					 CONFIG_CHOINKA_PUMP_ACTIVE_HIGH != 0);
+	if (err != ESP_OK) {
+		return err;
+	}
+	return pump_driver_set(false);
+}
+
+static void safety_timer_callback(void *arg)
+{
+	(void)arg;
+	esp_err_t driver_error = pump_driver_set(false);
+	TaskHandle_t task = NULL;
+
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	s_pump.safety_timeout_pending = true;
+	s_pump.safety_driver_error = driver_error;
+	task = s_pump.task;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+
+	if (task) {
+		xTaskNotifyGive(task);
+	}
+}
+
+static bool take_safety_timeout(esp_err_t *driver_error)
+{
+	bool pending;
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	pending = s_pump.safety_timeout_pending;
+	if (driver_error) {
+		*driver_error = s_pump.safety_driver_error;
+	}
+	s_pump.safety_timeout_pending = false;
+	s_pump.safety_driver_error = ESP_OK;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+	return pending;
+}
+
+static esp_err_t apply_controller_action(const pump_controller_action_t *action,
+					 uint64_t current_ms)
+{
+	if (!action) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	if (action->turn_off) {
+		esp_err_t stop_error = esp_timer_stop(s_pump.safety_timer);
+		if (stop_error != ESP_OK && stop_error != ESP_ERR_INVALID_STATE) {
+			ESP_LOGW(TAG, "failed to stop pump safety timer: %s",
+				 esp_err_to_name(stop_error));
 		}
-	}
-	#endif
-
-	#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-	{
-		adc_cali_line_fitting_config_t cal_cfg =
-		{
-			.unit_id = PUMP_ADC_UNIT,
-			.atten = ADC_ATTEN_DB_11,
-			.bitwidth = ADC_BITWIDTH_12,
-		};
-
-		if(adc_cali_create_scheme_line_fitting(&cal_cfg, &s_adc_cali) == ESP_OK)
-		{
-			s_adc_cal_ok = true;
-			ESP_LOGI(TAG, "ADC calibration: line fitting OK");
-			return;
-		}
-	}
-	#endif
-
-	ESP_LOGW(TAG, "ADC calibration not available -> using rough raw->mV mapping");
-}
-
-// adc калібрація
-
-/* -------------------------------------------------------------------------- */
-/*  Вимірювання напруги A->B та B->A через новий ADC                          */
-/* -------------------------------------------------------------------------- */
-
-/**
- * drive_a = true  -> A = 3.3V, міряємо B
- * drive_a = false -> B = 3.3V, міряємо A
- */
-static float measure_voltage(bool drive_a)
-{
-	const int	samples = 10;
-
-	int			sum_raw = 0;
-	int			sum_mv = 0;
-	int			mv_ok_cnt = 0;
-
-	// Обидва електроди спочатку в hi-Z
-	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_INPUT);
-	gpio_set_direction(s_pump.level_b_gpio, GPIO_MODE_INPUT);
-
-	gpio_num_t	drive_gpio	= drive_a ? s_pump.level_a_gpio : s_pump.level_b_gpio;
-	adc_channel_t sense_ch	= drive_a ? LEVEL_B_CHANNEL      : LEVEL_A_CHANNEL;
-
-	// drive -> вихід HIGH
-	gpio_set_direction(drive_gpio, GPIO_MODE_OUTPUT);
-	gpio_set_level(drive_gpio, 1);
-
-	vTaskDelay(pdMS_TO_TICKS(5));	// стабілізація
-
-	bool use_cali = (s_adc_cal_ok && s_adc_cali);
-
-	for (int i = 0; i < samples; ++i) {
-		int raw = 0;
-		esp_err_t err = adc_oneshot_read(s_adc, sense_ch, &raw);
+		esp_err_t err = pump_driver_set(false);
 		if (err != ESP_OK) {
-			ESP_LOGE(TAG, "adc_oneshot_read failed: %s", esp_err_to_name(err));
-			gpio_set_direction(drive_gpio, GPIO_MODE_INPUT);
-			return NAN;
+			pump_controller_note_driver_error(&s_pump.controller, current_ms);
+			return err;
 		}
-
-		if (use_cali) {
-			int mv = 0;
-			err = adc_cali_raw_to_voltage(s_adc_cali, raw, &mv);
-			if (err == ESP_OK) {
-				sum_mv += mv;
-				mv_ok_cnt++;
-			} else {
-				// якщо раптом якийсь семпл не конвертнувся — не валимо вимір, просто fallback на raw статистику
-				sum_raw += raw;
-			}
-		} else {
-			sum_raw += raw;
-		}
-
-		vTaskDelay(pdMS_TO_TICKS(2));
 	}
 
-	// Відпускаємо драйвер назад в hi-Z
-	gpio_set_direction(drive_gpio, GPIO_MODE_INPUT);
-
-	// ---- РОЗРЯД (анти-хвіст) ----
-	// коротко притискаємо обидва електроди до GND, щоб "скинути" заряд з дротів/електродів
-	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_OUTPUT);
-	gpio_set_direction(s_pump.level_b_gpio, GPIO_MODE_OUTPUT);
-	gpio_set_level(s_pump.level_a_gpio, 0);
-	gpio_set_level(s_pump.level_b_gpio, 0);
-	vTaskDelay(pdMS_TO_TICKS(2));
-
-	// назад в hi-Z
-	gpio_set_direction(s_pump.level_a_gpio, GPIO_MODE_INPUT);
-	gpio_set_direction(s_pump.level_b_gpio, GPIO_MODE_INPUT);
-
-
-	if (use_cali && mv_ok_cnt > 0) {
-		float avg_mv = (float)sum_mv / (float)mv_ok_cnt;
-		return avg_mv / 1000.0f;
+	if (action->turn_on) {
+		esp_err_t err = esp_timer_start_once(
+			s_pump.safety_timer,
+			(uint64_t)CONFIG_CHOINKA_PUMP_MAX_RUN_MS * 1000ULL);
+		if (err != ESP_OK) {
+			pump_controller_note_driver_error(&s_pump.controller, current_ms);
+			return err;
+		}
+		err = pump_driver_set(true);
+		if (err != ESP_OK) {
+			esp_timer_stop(s_pump.safety_timer);
+			pump_driver_set(false);
+			pump_controller_note_driver_error(&s_pump.controller, current_ms);
+			return err;
+		}
 	}
-
-	// fallback (як було раніше)
-	float avg_raw = (float)sum_raw / (float)samples;
-	return (avg_raw / ADC_MAX_RAW) * ADC_VREF;
+	return ESP_OK;
 }
 
-
-/**
- * Читаємо обидва напрями й отримуємо:
- * any_water = хоч один напрям явно "мокрий"
- * all_dry   = обидва напрями явно "сухі"
- */
-static void get_water_state(bool *any_water, bool *all_dry)
+static void publish_status(const water_level_snapshot_t *sensor,
+			   esp_err_t last_error, uint64_t current_ms)
 {
-	float u_ab = measure_voltage(true);		// A -> 3.3V, міряємо B
-	float u_ba = measure_voltage(false);	// B -> 3.3V, міряємо A
+	pump_node_status_t next = {
+		.level_state = sensor ? sensor->state : PUMP_LEVEL_UNKNOWN,
+		.voltage_ab_mv = sensor ? sensor->voltage_ab_mv : 0,
+		.voltage_ba_mv = sensor ? sensor->voltage_ba_mv : 0,
+		.adc_calibrated = sensor && sensor->calibrated,
+		.approximate_fallback = sensor && sensor->approximate_fallback,
+		.pump_on = s_pump.controller.pump_on && pump_driver_is_enabled(),
+		.cooldown_remaining_ms = pump_controller_cooldown_remaining_ms(
+			&s_pump.controller, current_ms),
+		.timeout_count = s_pump.controller.timeout_count,
+		.dry_streak = s_pump.controller.dry_streak,
+		.wet_streak = s_pump.controller.wet_streak,
+		.last_stop_reason = s_pump.controller.last_stop_reason,
+		.last_error = last_error,
+	};
+	if (next.pump_on) {
+		uint64_t elapsed = current_ms - s_pump.controller.pump_started_ms;
+		next.pump_run_ms = elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+	}
 
-	water_state_t s_ab = classify_voltage(u_ab);
-	water_state_t s_ba = classify_voltage(u_ba);
-
-	bool water_ab = (s_ab == WATER_WET);
-	bool water_ba = (s_ba == WATER_WET);
-	bool dry_ab   = (s_ab == WATER_DRY);
-	bool dry_ba   = (s_ba == WATER_DRY);
-
-	*any_water = (water_ab || water_ba);
-	*all_dry   = (dry_ab   && dry_ba);
-
-	ESP_LOGI(TAG,
-	         "getWaterState(): U_AB=%.3fV(%s)  U_BA=%.3fV(%s)  anyWater=%s allDry=%s",
-	         u_ab,
-	         s_ab == WATER_WET ? "WET" :
-	         s_ab == WATER_DRY ? "DRY" : "UNK",
-	         u_ba,
-	         s_ba == WATER_WET ? "WET" :
-	         s_ba == WATER_DRY ? "DRY" : "UNK",
-	         *any_water ? "YES" : "NO",
-	         *all_dry   ? "YES" : "NO");
+	if (xSemaphoreTake(s_pump.status_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+		s_pump.status = next;
+		xSemaphoreGive(s_pump.status_mutex);
+	}
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Один крок логіки автополиву                                              */
-/* -------------------------------------------------------------------------- */
-
-static void pump_step(void)
+static void log_state_change(const pump_node_status_t *before,
+			     const pump_node_status_t *after)
 {
-	uint32_t now = now_ms();
-
-	bool any_water = false;
-	bool all_dry   = false;
-	get_water_state(&any_water, &all_dry);
-
-	// оновлюємо стріки
-	if (any_water) {
-		s_pump.wet_streak++;
-		s_pump.dry_streak = 0;
-	} else if (all_dry) {
-		s_pump.dry_streak++;
-		s_pump.wet_streak = 0;
-	} else {
-		s_pump.wet_streak = 0;
-		s_pump.dry_streak = 0;
-	}
-
-	bool is_full = s_pump.stored_is_full;
-
-	if (s_pump.wet_streak >= WET_CONFIRM_CYCLES) {
-		is_full = true;
-		s_pump.stored_is_full = true;
-		s_pump.wet_streak = WET_CONFIRM_CYCLES;
-	}
-	if (s_pump.dry_streak >= DRY_CONFIRM_CYCLES) {
-		is_full = false;
-		s_pump.stored_is_full = false;
-		s_pump.dry_streak = DRY_CONFIRM_CYCLES;
-	}
-
-	s_pump.last_level_percent = is_full ? 100 : 0;
-
-	ESP_LOGI(TAG,
-	         "checkLevel(): isFull=%s pumpOn=%s dtSinceLast=%lu wet=%u dry=%u",
-	         is_full ? "YES" : "NO",
-	         s_pump.pump_on ? "YES" : "NO",
-	         (unsigned long)(now - s_pump.last_water_ms),
-	         (unsigned)s_pump.wet_streak,
-	         (unsigned)s_pump.dry_streak);
-
-	// ---- Якщо помпа ВЖЕ увімкнена ----
-	if (s_pump.pump_on) {
-		// тайм-аут
-		if (now - s_pump.pump_start_ms > MAX_PUMP_TIME_MS) {
-			ESP_LOGW(TAG, "Pump TIMEOUT -> OFF");
-			s_pump.pump_on = false;
-			gpio_set_level(s_pump.pump_gpio, 0);
-			s_pump.last_water_ms = now;
-			return;
-		}
-
-		// рівень став FULL -> вимикаємо
-		if (is_full) {
-			ESP_LOGI(TAG, "Level FULL -> pump OFF");
-			s_pump.pump_on = false;
-			gpio_set_level(s_pump.pump_gpio, 0);
-			s_pump.last_water_ms = now;
-		}
+	if (!before || !after) {
 		return;
 	}
-
-	// ---- Помпа вимкнена – вирішуємо, чи запускати ----
-
-	// 1. Пауза між поливами
-	if (now - s_pump.last_water_ms < MIN_PAUSE_MS) {
-		ESP_LOGI(TAG, "Too soon since last watering, skip.");
-		return;
+	if (before->level_state != after->level_state) {
+		ESP_LOGI(TAG, "level %s -> %s (%d/%d mV, cal:%u)",
+			 pump_node_level_name(before->level_state),
+			 pump_node_level_name(after->level_state),
+			 after->voltage_ab_mv, after->voltage_ba_mv,
+			 after->adc_calibrated ? 1U : 0U);
 	}
-
-	// 2. Включаємо помпу, якщо НЕ full (LOW)
-	if (!is_full) {
-		ESP_LOGI(TAG, "Level LOW -> pump ON");
-		s_pump.pump_on = true;
-		s_pump.pump_start_ms = now;
-		gpio_set_level(s_pump.pump_gpio, 1);
-	} else {
-		ESP_LOGI(TAG, "Level FULL by hysteresis, no watering.");
+	if (before->pump_on != after->pump_on) {
+		ESP_LOGI(TAG, "pump %s, reason:%s timeout_count:%" PRIu32,
+			 after->pump_on ? "ON" : "OFF",
+			 pump_node_stop_reason_name(after->last_stop_reason),
+			 after->timeout_count);
 	}
 }
-
-/* -------------------------------------------------------------------------- */
-/*  Таска                                                                     */
-/* -------------------------------------------------------------------------- */
 
 static void pump_node_task(void *arg)
 {
 	(void)arg;
+	uint64_t last_summary_ms = 0;
+	pump_node_status_t previous = {0};
+	pump_node_get_status(&previous);
+
 	for (;;) {
-		pump_step();
-		vTaskDelay(pdMS_TO_TICKS(CHECK_PERIOD_MS));
+		water_level_snapshot_t sensor = {0};
+		esp_err_t sensor_error = water_level_sensor_read(&sensor);
+		if (sensor_error != ESP_OK) {
+			sensor.state = PUMP_LEVEL_UNKNOWN;
+		}
+
+		esp_err_t safety_driver_error = ESP_OK;
+		bool safety_timeout = take_safety_timeout(&safety_driver_error);
+		uint64_t current_ms = now_ms();
+		pump_controller_action_t action = pump_controller_step(
+			&s_pump.controller, sensor.state, current_ms, safety_timeout);
+		esp_err_t action_error = apply_controller_action(&action, current_ms);
+		esp_err_t last_error = sensor_error != ESP_OK ? sensor_error : action_error;
+		if (safety_driver_error != ESP_OK) {
+			last_error = safety_driver_error;
+			pump_controller_note_driver_error(&s_pump.controller, current_ms);
+		}
+
+		publish_status(&sensor, last_error, current_ms);
+		pump_node_status_t current = {0};
+		pump_node_get_status(&current);
+		log_state_change(&previous, &current);
+		previous = current;
+
+		if (last_summary_ms == 0 || current_ms - last_summary_ms >=
+					      PUMP_SUMMARY_PERIOD_MS) {
+			last_summary_ms = current_ms;
+			ESP_LOGI(TAG,
+				 "state:%s pump:%u voltage:%d/%d mV cooldown:%" PRIu32
+				 "ms stop:%s timeouts:%" PRIu32 " err:%s",
+				 pump_node_level_name(current.level_state),
+				 current.pump_on ? 1U : 0U,
+				 current.voltage_ab_mv, current.voltage_ba_mv,
+				 current.cooldown_remaining_ms,
+				 pump_node_stop_reason_name(current.last_stop_reason),
+				 current.timeout_count,
+				 esp_err_to_name(current.last_error));
+		}
+
+		ulTaskNotifyTake(pdTRUE,
+				 pdMS_TO_TICKS(CONFIG_CHOINKA_PUMP_CHECK_PERIOD_MS));
 	}
 }
-
-/* -------------------------------------------------------------------------- */
-/*  Публічний API                                                             */
-/* -------------------------------------------------------------------------- */
 
 esp_err_t pump_node_init(const pump_node_pins_t *pins)
 {
-	if (s_pump.inited) {
-		return ESP_OK;
+	if (!pins) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	if (s_pump.initialized) {
+		return s_pump.pins.level_a_gpio == pins->level_a_gpio &&
+		       s_pump.pins.level_b_gpio == pins->level_b_gpio &&
+		       s_pump.pins.pump_gpio == pins->pump_gpio
+			       ? ESP_OK
+			       : ESP_ERR_INVALID_STATE;
 	}
 
-	memset(&s_pump, 0, sizeof(s_pump));
-	s_pump.level_a_gpio = pins->level_a_gpio;
-	s_pump.level_b_gpio = pins->level_b_gpio;
-	s_pump.pump_gpio    = pins->pump_gpio;
-
-	// Конфіг GPIO помпи
-	gpio_config_t pump_conf = {
-		.pin_bit_mask = 1ULL << s_pump.pump_gpio,
-		.mode         = GPIO_MODE_OUTPUT,
-		.pull_up_en   = GPIO_PULLUP_DISABLE,
-		.pull_down_en = GPIO_PULLDOWN_DISABLE,
-		.intr_type    = GPIO_INTR_DISABLE,
+	pump_controller_config_t controller_config = {
+		.max_pump_ms = CONFIG_CHOINKA_PUMP_MAX_RUN_MS,
+		.min_pause_ms = CONFIG_CHOINKA_PUMP_MIN_PAUSE_MS,
+		.dry_confirm_cycles = CONFIG_CHOINKA_LEVEL_DRY_CONFIRM_CYCLES,
+		.wet_confirm_cycles = CONFIG_CHOINKA_LEVEL_WET_CONFIRM_CYCLES,
 	};
-	ESP_ERROR_CHECK(gpio_config(&pump_conf));
-	gpio_set_level(s_pump.pump_gpio, 0);
+	if (!pump_controller_config_valid(&controller_config) ||
+	    CONFIG_CHOINKA_LEVEL_DRY_THRESHOLD_MV >=
+		    CONFIG_CHOINKA_LEVEL_WET_THRESHOLD_MV) {
+		return ESP_ERR_INVALID_ARG;
+	}
 
-	// ADC oneshot unit
-	adc_oneshot_unit_init_cfg_t unit_cfg = {
-		.unit_id = PUMP_ADC_UNIT,
-		.ulp_mode = ADC_ULP_MODE_DISABLE,
+	esp_err_t err = pump_node_early_safe_init(pins->pump_gpio);
+	if (err != ESP_OK) {
+		return err;
+	}
+	water_level_sensor_config_t sensor_config = {
+		.electrode_a_gpio = pins->level_a_gpio,
+		.electrode_b_gpio = pins->level_b_gpio,
+		.dry_threshold_mv = CONFIG_CHOINKA_LEVEL_DRY_THRESHOLD_MV,
+		.wet_threshold_mv = CONFIG_CHOINKA_LEVEL_WET_THRESHOLD_MV,
 	};
-	ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc));
+	err = water_level_sensor_init(&sensor_config);
+	if (err != ESP_OK) {
+		return err;
+	}
+	if (!pump_controller_selftest()) {
+		ESP_LOGE(TAG, "pump controller self-test failed");
+		return ESP_FAIL;
+	}
+	ESP_LOGI(TAG, "pump controller self-test passed");
 
-	adc_oneshot_chan_cfg_t chan_cfg = {
-		.bitwidth = ADC_BITWIDTH_12,
-		.atten    = ADC_ATTEN_DB_11,
+	s_pump.status_mutex = xSemaphoreCreateMutex();
+	if (!s_pump.status_mutex) {
+		return ESP_ERR_NO_MEM;
+	}
+	esp_timer_create_args_t timer_args = {
+		.callback = safety_timer_callback,
+		.name = "pump_guard",
+		.dispatch_method = ESP_TIMER_TASK,
 	};
-	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, LEVEL_A_CHANNEL, &chan_cfg));
-	ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, LEVEL_B_CHANNEL, &chan_cfg));
+	err = esp_timer_create(&timer_args, &s_pump.safety_timer);
+	if (err != ESP_OK) {
+		cleanup_partial_runtime();
+		return err;
+	}
 
-	// adc калібрація
-	adc_try_init_calibration();
-	ESP_LOGI(TAG, "ADC cal=%s", s_adc_cal_ok ? "YES" : "NO");
-	// adc калібрація
+	s_pump.pins = *pins;
+	pump_stop_reason_t initial_reason = PUMP_STOP_NONE;
+	if (CONFIG_CHOINKA_PUMP_BOOT_PULSE_ENABLE &&
+	    esp_reset_reason() == ESP_RST_POWERON) {
+		err = pump_driver_set(true);
+		if (err == ESP_OK) {
+			vTaskDelay(pdMS_TO_TICKS(CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS));
+			err = pump_driver_set(false);
+		}
+		if (err != ESP_OK) {
+			cleanup_partial_runtime();
+			return err;
+		}
+		initial_reason = PUMP_STOP_BOOT_PULSE;
+		ESP_LOGI(TAG, "cold-boot pump pulse completed (%d ms)",
+			 CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS);
+	}
 
-	// Початковий стан автополиву
-	uint32_t now = now_ms();
-	s_pump.pump_on        = false;
-	s_pump.pump_start_ms  = 0;
-	s_pump.last_water_ms  = now - MIN_PAUSE_MS;	// щоби одразу дозволити полив
-	s_pump.stored_is_full = false;
-	s_pump.wet_streak     = 0;
-	s_pump.dry_streak     = DRY_CONFIRM_CYCLES;
-	s_pump.last_level_percent = 0;
-
-	// Легкий "блінк" помпою як у Arduino
-	gpio_set_level(s_pump.pump_gpio, 1);
-	vTaskDelay(pdMS_TO_TICKS(200));
-	gpio_set_level(s_pump.pump_gpio, 0);
-
-	s_pump.inited = true;
+	uint64_t current_ms = now_ms();
+	pump_controller_init(&s_pump.controller, &controller_config, current_ms,
+			     initial_reason);
+	s_pump.initialized = true;
+	water_level_snapshot_t initial_sensor = {
+		.state = PUMP_LEVEL_UNKNOWN,
+	};
+	publish_status(&initial_sensor, ESP_OK, current_ms);
 
 	ESP_LOGI(TAG,
-	         "init done (A=GPIO%d, B=GPIO%d, pump=GPIO%d)",
-	         (int)s_pump.level_a_gpio,
-	         (int)s_pump.level_b_gpio,
-	         (int)s_pump.pump_gpio);
-
+		 "initialized A:GPIO%d B:GPIO%d pump:GPIO%d active_high:%u",
+		 (int)pins->level_a_gpio, (int)pins->level_b_gpio,
+		 (int)pins->pump_gpio, CONFIG_CHOINKA_PUMP_ACTIVE_HIGH ? 1U : 0U);
 	return ESP_OK;
 }
 
-void pump_node_start_task(UBaseType_t prio)
+esp_err_t pump_node_start_task(UBaseType_t priority)
 {
-	static bool started = false;
-	if (started) {
-		return;
+	if (!s_pump.initialized) {
+		return ESP_ERR_INVALID_STATE;
 	}
-	started = true;
+	if (s_pump.task) {
+		return ESP_OK;
+	}
+	TaskHandle_t task = NULL;
+	BaseType_t created = xTaskCreate(pump_node_task, "pump_node", 5120, NULL,
+					priority, &task);
+	if (created != pdPASS) {
+		return ESP_ERR_NO_MEM;
+	}
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	s_pump.task = task;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+	return ESP_OK;
+}
 
-	BaseType_t ok = xTaskCreate(
-		pump_node_task,
-		"pump_node",
-		4096,
-		NULL,
-		prio,
-		NULL
-	);
-	if (ok != pdPASS) {
-		ESP_LOGE(TAG, "failed to create pump_node task");
+bool pump_node_get_status(pump_node_status_t *status)
+{
+	if (!status || !s_pump.status_mutex) {
+		return false;
 	}
+	if (xSemaphoreTake(s_pump.status_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+		return false;
+	}
+	*status = s_pump.status;
+	xSemaphoreGive(s_pump.status_mutex);
+	return true;
 }
 
 int pump_node_get_last_level_percent(void)
 {
-	return s_pump.last_level_percent;
+	pump_node_status_t status = {0};
+	if (!pump_node_get_status(&status)) {
+		return 0;
+	}
+	return status.level_state == PUMP_LEVEL_WET ? 100 : 0;
 }
 
 bool pump_node_is_pump_on(void)
 {
-	return s_pump.pump_on;
+	pump_node_status_t status = {0};
+	return pump_node_get_status(&status) && status.pump_on;
 }
