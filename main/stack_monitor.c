@@ -217,14 +217,13 @@ static void stack_monitor_task(void *arg)
 }
 
 // Public monitor start.
-void stack_monitor_start(UBaseType_t priority)
+esp_err_t stack_monitor_start(UBaseType_t priority)
 {
 	static bool started = false;
 
 	if (started) {
-		return;
+		return ESP_OK;
 	}
-	started = true;
 
 	BaseType_t ok = xTaskCreate(
 			stack_monitor_task,
@@ -236,5 +235,8 @@ void stack_monitor_start(UBaseType_t priority)
 
 	if (ok != pdPASS) {
 		ESP_LOGE(TAG, "failed to create stack_monitor task");
+		return ESP_ERR_NO_MEM;
 	}
+	started = true;
+	return ESP_OK;
 }

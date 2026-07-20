@@ -37,9 +37,9 @@ static esp_err_t raw_mesh_send(void *user, const uint8_t dst[6],
 	return esp_mesh_send(&dest, &data, MESH_DATA_P2P, NULL, 0);
 }
 
-void mesh_v2_link_require(void)
+esp_err_t mesh_v2_link_require(void)
 {
-	if (s_tx_broker) return;
+	if (s_tx_broker) return ESP_OK;
 	keemash_mesh_tx_broker_config_t cfg = {
 		.slots = 24,
 		.max_packet_size = 512,
@@ -48,7 +48,7 @@ void mesh_v2_link_require(void)
 		.task_name = "mesh_tx",
 		.raw_send = raw_mesh_send,
 	};
-	ESP_ERROR_CHECK(keemash_mesh_tx_broker_init(&s_tx_broker, &cfg));
+	return keemash_mesh_tx_broker_init(&s_tx_broker, &cfg);
 }
 
 static bool mac_is_zero(const uint8_t mac[6])

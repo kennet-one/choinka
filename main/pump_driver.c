@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+
 typedef struct {
 	bool initialized;
 	bool active_high;
@@ -10,6 +12,7 @@ typedef struct {
 } pump_driver_context_t;
 
 static pump_driver_context_t s_driver;
+static portMUX_TYPE s_driver_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static uint32_t output_level(bool enabled)
 {
@@ -59,17 +62,24 @@ esp_err_t pump_driver_init(gpio_num_t gpio, bool active_high)
 
 esp_err_t pump_driver_set(bool enabled)
 {
+	esp_err_t err;
+	portENTER_CRITICAL(&s_driver_lock);
 	if (!s_driver.initialized) {
+		portEXIT_CRITICAL(&s_driver_lock);
 		return ESP_ERR_INVALID_STATE;
 	}
-	esp_err_t err = gpio_set_level(s_driver.gpio, output_level(enabled));
+	err = gpio_set_level(s_driver.gpio, output_level(enabled));
 	if (err == ESP_OK) {
 		s_driver.enabled = enabled;
 	}
+	portEXIT_CRITICAL(&s_driver_lock);
 	return err;
 }
 
 bool pump_driver_is_enabled(void)
 {
-	return s_driver.initialized && s_driver.enabled;
+	portENTER_CRITICAL(&s_driver_lock);
+	bool enabled = s_driver.initialized && s_driver.enabled;
+	portEXIT_CRITICAL(&s_driver_lock);
+	return enabled;
 }

@@ -108,6 +108,8 @@ static uint32_t s_last_root_recovery_log_ms = 0;
 static uint32_t s_last_root_rx_ms = 0;
 static bool s_manual_reboot_pending = false;
 static uint16_t s_manual_reboot_delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
+static portMUX_TYPE s_manual_reboot_lock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_mesh_rx_task = NULL;
 
 typedef struct {
 	uint32_t magic;
@@ -523,13 +525,20 @@ static void manual_reboot_task(void *arg)
 
 esp_err_t mesh_manual_reboot_schedule(uint16_t delay_ms, const char *reason)
 {
-	if (s_manual_reboot_pending) return ESP_ERR_INVALID_STATE;
 	if (delay_ms < MANUAL_REBOOT_DELAY_MIN_MS ||
 	    delay_ms > MANUAL_REBOOT_DELAY_MAX_MS) delay_ms = MANUAL_REBOOT_DELAY_DEFAULT_MS;
+	portENTER_CRITICAL(&s_manual_reboot_lock);
+	if (s_manual_reboot_pending) {
+		portEXIT_CRITICAL(&s_manual_reboot_lock);
+		return ESP_ERR_INVALID_STATE;
+	}
 	s_manual_reboot_pending = true;
 	s_manual_reboot_delay_ms = delay_ms;
+	portEXIT_CRITICAL(&s_manual_reboot_lock);
 	if (xTaskCreate(manual_reboot_task, "manual_reboot", 2048, NULL, 6, NULL) != pdPASS) {
+		portENTER_CRITICAL(&s_manual_reboot_lock);
 		s_manual_reboot_pending = false;
+		portEXIT_CRITICAL(&s_manual_reboot_lock);
 		return ESP_ERR_NO_MEM;
 	}
 	ESP_LOGW(MESH_TAG, "manual reboot scheduled delay=%u reason=%s",
@@ -549,12 +558,6 @@ static void handle_reboot_request(const mesh_reboot_request_packet_t *p,
 	memcpy(reason, p->reason, sizeof(p->reason));
 	reason[sizeof(reason) - 1] = '\0';
 
-	if (s_manual_reboot_pending) {
-		(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_BUSY,
-		                         "manual reboot already pending");
-		return;
-	}
-
 	uint16_t delay_ms = p->delay_ms;
 	if (delay_ms < MANUAL_REBOOT_DELAY_MIN_MS ||
 	    delay_ms > MANUAL_REBOOT_DELAY_MAX_MS) {
@@ -563,8 +566,13 @@ static void handle_reboot_request(const mesh_reboot_request_packet_t *p,
 
 	esp_err_t reboot_err = mesh_manual_reboot_schedule(delay_ms, reason);
 	if (reboot_err != ESP_OK) {
-		(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_ERROR,
-		                         "reboot task failed");
+		(void)send_reboot_status(
+			p->seq,
+			reboot_err == ESP_ERR_INVALID_STATE ? MESH_REBOOT_STATUS_BUSY
+			                                      : MESH_REBOOT_STATUS_ERROR,
+			reboot_err == ESP_ERR_INVALID_STATE
+				? "manual reboot already pending"
+				: "reboot task failed");
 		return;
 	}
 	(void)send_reboot_status(p->seq, MESH_REBOOT_STATUS_OK,
@@ -702,14 +710,15 @@ static void mesh_rx_task(void *arg)
 
 static esp_err_t mesh_comm_start(void)
 {
-	static bool started = false;
-
-	if (!started) {
-		started = true;
-		xTaskCreate(mesh_rx_task, "mesh_rx", 4096, NULL, 5, NULL);
-		stack_monitor_start(3);
+	if (!s_mesh_rx_task) {
+		TaskHandle_t task = NULL;
+		if (xTaskCreate(mesh_rx_task, "mesh_rx", 6144, NULL, 5, &task) != pdPASS) {
+			ESP_LOGE(MESH_TAG, "failed to create mesh RX task");
+			return ESP_ERR_NO_MEM;
+		}
+		s_mesh_rx_task = task;
 	}
-	return ESP_OK;
+	return stack_monitor_start(3);
 }
 
 static esp_err_t mesh_service_init_and_start(void)
@@ -852,7 +861,8 @@ static esp_err_t mesh_platform_init_and_start(void)
 	if (!runtime_ready) {
 		mesh_time_sync_init();
 		log_time_vprintf_start();
-		mesh_v2_link_require();
+		err = mesh_v2_link_require();
+		if (err != ESP_OK) return err;
 		mesh_v2_node_set_relay_eligible(CONFIG_CHOINKA_MESH_RELAY_ELIGIBLE);
 		mesh_v2_node_init(MESH_TAG);
 		err = mesh_log_stream_init(MESH_TAG);
@@ -1274,7 +1284,6 @@ static void mesh_event_handler(void *arg,
 			esp_netif_dhcpc_stop(netif_sta);
 			esp_netif_dhcpc_start(netif_sta);
 		}
-		mesh_comm_start();
 	}
 	break;
 
@@ -1404,7 +1413,6 @@ void app_main(void)
 	}
 
 	diag_boot_init();
-	ota_mark_running_app_valid_if_pending();
 
 	uint32_t retry_delay_ms = 1000;
 	esp_err_t mesh_error;
@@ -1418,6 +1426,12 @@ void app_main(void)
 			if (retry_delay_ms > 30000) retry_delay_ms = 30000;
 		}
 	}
+	while ((mesh_error = mesh_comm_start()) != ESP_OK) {
+		ESP_LOGE(MESH_TAG,
+		         "mesh communication startup failed: %s; retrying in 1000 ms",
+		         esp_err_to_name(mesh_error));
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
 
 	while (!s_mesh_reconnect_task) {
 		BaseType_t created = xTaskCreate(mesh_reconnect_watchdog_task,
@@ -1428,6 +1442,13 @@ void app_main(void)
 				 "failed to create mesh reconnect task; retrying in 1000 ms");
 			vTaskDelay(pdMS_TO_TICKS(1000));
 		}
+	}
+
+	if (pump_error == ESP_OK) {
+		ota_mark_running_app_valid_if_pending();
+	} else {
+		ESP_LOGW(MESH_TAG,
+		         "OTA rollback remains pending because pump startup is unhealthy");
 	}
 
 	ESP_LOGI(MESH_TAG,
