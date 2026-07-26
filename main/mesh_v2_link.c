@@ -110,10 +110,11 @@ bool keemash_mesh_node_on_control_command_result(const char *text, uint8_t *stat
 	}
 	if (result && result_size > 0) {
 		snprintf(result, result_size,
-		         "exec=%lu level=%s pump=%u mv=%d/%d cal=%u cd=%lu stop=%s tout=%lu",
+		         "exec=%lu level=%s pump=%u block=%u mv=%d/%d cal=%u cd=%lu stop=%s tout=%lu",
 		         (unsigned long)s_status_command_exec_count,
 		         pump_node_level_name(pump_status.level_state),
 		         pump_status.pump_on ? 1U : 0U,
+		         pump_status.hardware_blocked ? 1U : 0U,
 		         pump_status.voltage_ab_mv, pump_status.voltage_ba_mv,
 		         pump_status.adc_calibrated ? 1U : 0U,
 		         (unsigned long)pump_status.cooldown_remaining_ms,

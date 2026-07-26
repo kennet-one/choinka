@@ -23,6 +23,9 @@
 #ifndef CONFIG_CHOINKA_PUMP_CHECK_PERIOD_MS
 #define CONFIG_CHOINKA_PUMP_CHECK_PERIOD_MS 1000
 #endif
+#ifndef CONFIG_CHOINKA_PUMP_BLOCK_POLL_MS
+#define CONFIG_CHOINKA_PUMP_BLOCK_POLL_MS 20
+#endif
 #ifndef CONFIG_CHOINKA_PUMP_MAX_RUN_MS
 #define CONFIG_CHOINKA_PUMP_MAX_RUN_MS 3000
 #endif
@@ -54,9 +57,12 @@ typedef struct {
 	SemaphoreHandle_t status_mutex;
 	TaskHandle_t task;
 	esp_timer_handle_t safety_timer;
+	esp_timer_handle_t block_timer;
 	portMUX_TYPE safety_lock;
 	bool safety_timeout_pending;
 	esp_err_t safety_driver_error;
+	bool hardware_blocked;
+	esp_err_t block_driver_error;
 } pump_node_context_t;
 
 static pump_node_context_t s_pump = {
@@ -70,6 +76,11 @@ static void cleanup_partial_runtime(void)
 		(void)esp_timer_stop(s_pump.safety_timer);
 		(void)esp_timer_delete(s_pump.safety_timer);
 		s_pump.safety_timer = NULL;
+	}
+	if (s_pump.block_timer) {
+		(void)esp_timer_stop(s_pump.block_timer);
+		(void)esp_timer_delete(s_pump.block_timer);
+		s_pump.block_timer = NULL;
 	}
 	if (s_pump.status_mutex) {
 		vSemaphoreDelete(s_pump.status_mutex);
@@ -105,6 +116,8 @@ const char *pump_node_stop_reason_name(pump_stop_reason_t reason)
 		return "sensor_unknown";
 	case PUMP_STOP_SAFETY_TIMEOUT:
 		return "safety_timeout";
+	case PUMP_STOP_HARDWARE_BLOCK:
+		return "hardware_block";
 	case PUMP_STOP_DRIVER_ERROR:
 		return "driver_error";
 	default:
@@ -112,10 +125,12 @@ const char *pump_node_stop_reason_name(pump_stop_reason_t reason)
 	}
 }
 
-esp_err_t pump_node_early_safe_init(gpio_num_t pump_gpio)
+esp_err_t pump_node_early_safe_init(gpio_num_t pump_gpio,
+				    gpio_num_t pump_block_gpio)
 {
 	esp_err_t err = pump_driver_init(pump_gpio,
-					 CONFIG_CHOINKA_PUMP_ACTIVE_HIGH != 0);
+					 CONFIG_CHOINKA_PUMP_ACTIVE_HIGH != 0,
+					 pump_block_gpio);
 	if (err != ESP_OK) {
 		return err;
 	}
@@ -153,6 +168,45 @@ static bool take_safety_timeout(esp_err_t *driver_error)
 	return pending;
 }
 
+static void block_guard_timer_callback(void *arg)
+{
+	(void)arg;
+	bool blocked = pump_driver_is_hardware_blocked();
+	esp_err_t driver_error = ESP_OK;
+	if (blocked && pump_driver_is_enabled()) {
+		driver_error = pump_driver_set(false);
+	}
+
+	TaskHandle_t task = NULL;
+	bool notify = false;
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	notify = blocked != s_pump.hardware_blocked ||
+		 driver_error != ESP_OK;
+	s_pump.hardware_blocked = blocked;
+	if (driver_error != ESP_OK) {
+		s_pump.block_driver_error = driver_error;
+	}
+	task = s_pump.task;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+
+	if (notify && task) {
+		xTaskNotifyGive(task);
+	}
+}
+
+static bool take_hardware_block(esp_err_t *driver_error)
+{
+	bool blocked;
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	blocked = s_pump.hardware_blocked;
+	if (driver_error) {
+		*driver_error = s_pump.block_driver_error;
+	}
+	s_pump.block_driver_error = ESP_OK;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+	return blocked;
+}
+
 static esp_err_t apply_controller_action(const pump_controller_action_t *action,
 					 uint64_t current_ms)
 {
@@ -184,6 +238,12 @@ static esp_err_t apply_controller_action(const pump_controller_action_t *action,
 		if (err != ESP_OK) {
 			esp_timer_stop(s_pump.safety_timer);
 			pump_driver_set(false);
+			if (err == ESP_ERR_INVALID_STATE &&
+			    pump_driver_is_hardware_blocked()) {
+				pump_controller_note_hardware_block(
+					&s_pump.controller, current_ms);
+				return ESP_OK;
+			}
 			pump_controller_note_driver_error(&s_pump.controller, current_ms);
 			return err;
 		}
@@ -201,6 +261,7 @@ static void publish_status(const water_level_snapshot_t *sensor,
 		.adc_calibrated = sensor && sensor->calibrated,
 		.approximate_fallback = sensor && sensor->approximate_fallback,
 		.pump_on = s_pump.controller.pump_on && pump_driver_is_enabled(),
+		.hardware_blocked = pump_driver_is_hardware_blocked(),
 		.cooldown_remaining_ms = pump_controller_cooldown_remaining_ms(
 			&s_pump.controller, current_ms),
 		.timeout_count = s_pump.controller.timeout_count,
@@ -239,6 +300,15 @@ static void log_state_change(const pump_node_status_t *before,
 			 pump_node_stop_reason_name(after->last_stop_reason),
 			 after->timeout_count);
 	}
+	if (before->hardware_blocked != after->hardware_blocked) {
+		if (after->hardware_blocked) {
+			ESP_LOGW(TAG, "hardware pump block ON (GPIO%d LOW)",
+				 (int)s_pump.pins.pump_block_gpio);
+		} else {
+			ESP_LOGI(TAG, "hardware pump block OFF (GPIO%d HIGH)",
+				 (int)s_pump.pins.pump_block_gpio);
+		}
+	}
 }
 
 static void pump_node_task(void *arg)
@@ -257,13 +327,20 @@ static void pump_node_task(void *arg)
 
 		esp_err_t safety_driver_error = ESP_OK;
 		bool safety_timeout = take_safety_timeout(&safety_driver_error);
+		esp_err_t block_driver_error = ESP_OK;
+		bool hardware_blocked = take_hardware_block(&block_driver_error);
 		uint64_t current_ms = now_ms();
 		pump_controller_action_t action = pump_controller_step(
-			&s_pump.controller, sensor.state, current_ms, safety_timeout);
+			&s_pump.controller, sensor.state, current_ms, safety_timeout,
+			hardware_blocked);
 		esp_err_t action_error = apply_controller_action(&action, current_ms);
 		esp_err_t last_error = sensor_error != ESP_OK ? sensor_error : action_error;
 		if (safety_driver_error != ESP_OK) {
 			last_error = safety_driver_error;
+			pump_controller_note_driver_error(&s_pump.controller, current_ms);
+		}
+		if (block_driver_error != ESP_OK) {
+			last_error = block_driver_error;
 			pump_controller_note_driver_error(&s_pump.controller, current_ms);
 		}
 
@@ -277,10 +354,11 @@ static void pump_node_task(void *arg)
 					      PUMP_SUMMARY_PERIOD_MS) {
 			last_summary_ms = current_ms;
 			ESP_LOGI(TAG,
-				 "state:%s pump:%u voltage:%d/%d mV cooldown:%" PRIu32
+				 "state:%s pump:%u block:%u voltage:%d/%d mV cooldown:%" PRIu32
 				 "ms stop:%s timeouts:%" PRIu32 " err:%s",
 				 pump_node_level_name(current.level_state),
 				 current.pump_on ? 1U : 0U,
+				 current.hardware_blocked ? 1U : 0U,
 				 current.voltage_ab_mv, current.voltage_ba_mv,
 				 current.cooldown_remaining_ms,
 				 pump_node_stop_reason_name(current.last_stop_reason),
@@ -301,7 +379,8 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	if (s_pump.initialized) {
 		return s_pump.pins.level_a_gpio == pins->level_a_gpio &&
 		       s_pump.pins.level_b_gpio == pins->level_b_gpio &&
-		       s_pump.pins.pump_gpio == pins->pump_gpio
+		       s_pump.pins.pump_gpio == pins->pump_gpio &&
+		       s_pump.pins.pump_block_gpio == pins->pump_block_gpio
 			       ? ESP_OK
 			       : ESP_ERR_INVALID_STATE;
 	}
@@ -318,7 +397,8 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 		return ESP_ERR_INVALID_ARG;
 	}
 
-	esp_err_t err = pump_node_early_safe_init(pins->pump_gpio);
+	esp_err_t err = pump_node_early_safe_init(pins->pump_gpio,
+						  pins->pump_block_gpio);
 	if (err != ESP_OK) {
 		return err;
 	}
@@ -354,21 +434,67 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	}
 
 	s_pump.pins = *pins;
-	pump_stop_reason_t initial_reason = PUMP_STOP_NONE;
+	esp_timer_create_args_t block_timer_args = {
+		.callback = block_guard_timer_callback,
+		.name = "pump_block",
+		.dispatch_method = ESP_TIMER_TASK,
+	};
+	err = esp_timer_create(&block_timer_args, &s_pump.block_timer);
+	if (err != ESP_OK) {
+		cleanup_partial_runtime();
+		return err;
+	}
+	bool initial_hardware_blocked = pump_driver_is_hardware_blocked();
+	portENTER_CRITICAL(&s_pump.safety_lock);
+	s_pump.hardware_blocked = initial_hardware_blocked;
+	s_pump.block_driver_error = ESP_OK;
+	portEXIT_CRITICAL(&s_pump.safety_lock);
+	err = esp_timer_start_periodic(
+		s_pump.block_timer,
+		(uint64_t)CONFIG_CHOINKA_PUMP_BLOCK_POLL_MS * 1000ULL);
+	if (err != ESP_OK) {
+		cleanup_partial_runtime();
+		return err;
+	}
+
+	bool hardware_blocked = pump_driver_is_hardware_blocked();
+	pump_stop_reason_t initial_reason = hardware_blocked
+						 ? PUMP_STOP_HARDWARE_BLOCK
+						 : PUMP_STOP_NONE;
 	if (CONFIG_CHOINKA_PUMP_BOOT_PULSE_ENABLE &&
 	    esp_reset_reason() == ESP_RST_POWERON) {
-		err = pump_driver_set(true);
-		if (err == ESP_OK) {
-			vTaskDelay(pdMS_TO_TICKS(CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS));
-			err = pump_driver_set(false);
+		if (hardware_blocked) {
+			ESP_LOGW(TAG,
+				 "cold-boot pump pulse skipped: hardware block active");
+		} else {
+			err = pump_driver_set(true);
+			if (err == ESP_OK) {
+				vTaskDelay(pdMS_TO_TICKS(
+					CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS));
+			}
+			hardware_blocked = pump_driver_is_hardware_blocked();
+			if (err == ESP_ERR_INVALID_STATE && hardware_blocked) {
+				err = ESP_OK;
+			}
+			esp_err_t stop_error = pump_driver_set(false);
+			if (err == ESP_OK && stop_error != ESP_OK) {
+				err = stop_error;
+			}
+			if (err != ESP_OK) {
+				cleanup_partial_runtime();
+				return err;
+			}
+			if (hardware_blocked) {
+				initial_reason = PUMP_STOP_HARDWARE_BLOCK;
+				ESP_LOGW(TAG,
+					 "cold-boot pump pulse interrupted by hardware block");
+			} else {
+				initial_reason = PUMP_STOP_BOOT_PULSE;
+				ESP_LOGI(TAG,
+					 "cold-boot pump pulse completed (%d ms)",
+					 CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS);
+			}
 		}
-		if (err != ESP_OK) {
-			cleanup_partial_runtime();
-			return err;
-		}
-		initial_reason = PUMP_STOP_BOOT_PULSE;
-		ESP_LOGI(TAG, "cold-boot pump pulse completed (%d ms)",
-			 CONFIG_CHOINKA_PUMP_BOOT_PULSE_MS);
 	}
 
 	uint64_t current_ms = now_ms();
@@ -381,9 +507,13 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	publish_status(&initial_sensor, ESP_OK, current_ms);
 
 	ESP_LOGI(TAG,
-		 "initialized A:GPIO%d B:GPIO%d pump:GPIO%d active_high:%u",
+		 "initialized A:GPIO%d B:GPIO%d pump:GPIO%d active_high:%u "
+		 "block:GPIO%d active_low:1 state:%u poll:%dms",
 		 (int)pins->level_a_gpio, (int)pins->level_b_gpio,
-		 (int)pins->pump_gpio, CONFIG_CHOINKA_PUMP_ACTIVE_HIGH ? 1U : 0U);
+		 (int)pins->pump_gpio, CONFIG_CHOINKA_PUMP_ACTIVE_HIGH ? 1U : 0U,
+		 (int)pins->pump_block_gpio,
+		 pump_driver_is_hardware_blocked() ? 1U : 0U,
+		 CONFIG_CHOINKA_PUMP_BLOCK_POLL_MS);
 	return ESP_OK;
 }
 

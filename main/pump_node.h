@@ -16,6 +16,7 @@ typedef struct {
 	gpio_num_t level_a_gpio;
 	gpio_num_t level_b_gpio;
 	gpio_num_t pump_gpio;
+	gpio_num_t pump_block_gpio;
 } pump_node_pins_t;
 
 typedef struct {
@@ -25,6 +26,7 @@ typedef struct {
 	bool adc_calibrated;
 	bool approximate_fallback;
 	bool pump_on;
+	bool hardware_blocked;
 	uint32_t pump_run_ms;
 	uint32_t cooldown_remaining_ms;
 	uint32_t timeout_count;
@@ -35,7 +37,8 @@ typedef struct {
 } pump_node_status_t;
 
 /* Configure the pump output in its inactive state as early as possible. */
-esp_err_t pump_node_early_safe_init(gpio_num_t pump_gpio);
+esp_err_t pump_node_early_safe_init(gpio_num_t pump_gpio,
+				    gpio_num_t pump_block_gpio);
 
 esp_err_t pump_node_init(const pump_node_pins_t *pins);
 esp_err_t pump_node_start_task(UBaseType_t priority);

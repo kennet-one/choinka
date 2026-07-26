@@ -1397,9 +1397,11 @@ void app_main(void)
 		.level_a_gpio = GPIO_NUM_32,
 		.level_b_gpio = GPIO_NUM_33,
 		.pump_gpio = GPIO_NUM_26,
+		.pump_block_gpio = GPIO_NUM_4,
 	};
 
-	esp_err_t pump_error = pump_node_early_safe_init(pump_pins.pump_gpio);
+	esp_err_t pump_error = pump_node_early_safe_init(
+		pump_pins.pump_gpio, pump_pins.pump_block_gpio);
 	if (pump_error == ESP_OK) {
 		pump_error = pump_node_init(&pump_pins);
 	}
@@ -1407,7 +1409,8 @@ void app_main(void)
 		pump_error = pump_node_start_task(5);
 	}
 	if (pump_error != ESP_OK) {
-		(void)pump_node_early_safe_init(pump_pins.pump_gpio);
+		(void)pump_node_early_safe_init(
+			pump_pins.pump_gpio, pump_pins.pump_block_gpio);
 		ESP_LOGE(MESH_TAG, "autonomous pump startup failed: %s",
 			 esp_err_to_name(pump_error));
 	}

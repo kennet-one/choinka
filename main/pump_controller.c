@@ -52,7 +52,8 @@ static pump_controller_action_t stop_pump(pump_controller_t *controller,
 pump_controller_action_t pump_controller_step(pump_controller_t *controller,
 					       pump_level_state_t level,
 					       uint64_t now_ms,
-					       bool safety_timeout)
+					       bool safety_timeout,
+					       bool hardware_blocked)
 {
 	pump_controller_action_t action = {0};
 	if (!controller || !pump_controller_config_valid(&controller->config)) {
@@ -80,6 +81,15 @@ pump_controller_action_t pump_controller_step(pump_controller_t *controller,
 	if (controller->dry_streak >= controller->config.dry_confirm_cycles) {
 		controller->level_full = false;
 		controller->level_known = true;
+	}
+
+	if (hardware_blocked) {
+		controller->dry_streak = 0;
+		if (controller->pump_on) {
+			return stop_pump(controller, now_ms,
+					 PUMP_STOP_HARDWARE_BLOCK);
+		}
+		return action;
 	}
 
 	if (controller->pump_on) {
@@ -121,6 +131,18 @@ void pump_controller_note_driver_error(pump_controller_t *controller,
 	controller->pump_on = false;
 	controller->last_stopped_ms = now_ms;
 	controller->last_stop_reason = PUMP_STOP_DRIVER_ERROR;
+}
+
+void pump_controller_note_hardware_block(pump_controller_t *controller,
+					 uint64_t now_ms)
+{
+	if (!controller) {
+		return;
+	}
+	controller->pump_on = false;
+	controller->dry_streak = 0;
+	controller->last_stopped_ms = now_ms;
+	controller->last_stop_reason = PUMP_STOP_HARDWARE_BLOCK;
 }
 
 uint32_t pump_controller_cooldown_remaining_ms(const pump_controller_t *controller,

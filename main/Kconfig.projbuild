@@ -148,6 +148,14 @@ menu "Example Configuration"
             range 100 10000
             default 1000
 
+        config CHOINKA_PUMP_BLOCK_POLL_MS
+            int "GPIO4 hardware pump-block poll period (ms)"
+            range 5 1000
+            default 20
+            help
+                Poll the active-low D4/GPIO4 strap. Closing the strap to GND
+                prevents pump starts and stops an active pump.
+
         config CHOINKA_PUMP_MAX_RUN_MS
             int "Maximum pump run time (ms)"
             range 100 30000

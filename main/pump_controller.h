@@ -19,6 +19,7 @@ typedef enum {
 	PUMP_STOP_LEVEL_WET,
 	PUMP_STOP_SENSOR_UNKNOWN,
 	PUMP_STOP_SAFETY_TIMEOUT,
+	PUMP_STOP_HARDWARE_BLOCK,
 	PUMP_STOP_DRIVER_ERROR,
 } pump_stop_reason_t;
 
@@ -58,10 +59,13 @@ void pump_controller_init(pump_controller_t *controller,
 pump_controller_action_t pump_controller_step(pump_controller_t *controller,
 					       pump_level_state_t level,
 					       uint64_t now_ms,
-					       bool safety_timeout);
+					       bool safety_timeout,
+					       bool hardware_blocked);
 
 void pump_controller_note_driver_error(pump_controller_t *controller,
 				       uint64_t now_ms);
+void pump_controller_note_hardware_block(pump_controller_t *controller,
+					 uint64_t now_ms);
 
 uint32_t pump_controller_cooldown_remaining_ms(const pump_controller_t *controller,
 					       uint64_t now_ms);
