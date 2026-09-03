@@ -6,6 +6,11 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "sdkconfig.h"
+#ifndef CONFIG_CHOINKA_ELECTRODE_TEST_ENFORCE
+#define CONFIG_CHOINKA_ELECTRODE_TEST_ENFORCE 0
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -33,20 +38,32 @@ typedef struct {
 
 static water_level_context_t s_sensor;
 
-static void electrodes_high_impedance(void)
+static void settle_ms(uint32_t ms)
 {
-	gpio_set_direction(s_sensor.config.electrode_a_gpio, GPIO_MODE_INPUT);
-	gpio_set_direction(s_sensor.config.electrode_b_gpio, GPIO_MODE_INPUT);
+	/* A tick can end immediately; verify elapsed time instead of rounding down. */
+	int64_t deadline = esp_timer_get_time() + (int64_t)ms * 1000;
+	do {
+		vTaskDelay(1);
+	} while (esp_timer_get_time() < deadline);
 }
 
-static void electrodes_discharge(void)
+static esp_err_t electrodes_high_impedance(void)
 {
-	gpio_set_direction(s_sensor.config.electrode_a_gpio, GPIO_MODE_OUTPUT);
-	gpio_set_direction(s_sensor.config.electrode_b_gpio, GPIO_MODE_OUTPUT);
-	gpio_set_level(s_sensor.config.electrode_a_gpio, 0);
-	gpio_set_level(s_sensor.config.electrode_b_gpio, 0);
-	vTaskDelay(pdMS_TO_TICKS(2));
-	electrodes_high_impedance();
+	esp_err_t a = gpio_set_direction(s_sensor.config.electrode_a_gpio, GPIO_MODE_INPUT);
+	esp_err_t b = gpio_set_direction(s_sensor.config.electrode_b_gpio, GPIO_MODE_INPUT);
+	return a != ESP_OK ? a : b;
+}
+
+static esp_err_t electrodes_discharge(void)
+{
+	/* Clear latches before output enable, avoiding a stale HIGH pulse. */
+	esp_err_t err = gpio_set_level(s_sensor.config.electrode_a_gpio, 0);
+	if (err == ESP_OK) err = gpio_set_level(s_sensor.config.electrode_b_gpio, 0);
+	if (err == ESP_OK) err = gpio_set_direction(s_sensor.config.electrode_a_gpio, GPIO_MODE_OUTPUT);
+	if (err == ESP_OK) err = gpio_set_direction(s_sensor.config.electrode_b_gpio, GPIO_MODE_OUTPUT);
+	if (err == ESP_OK) settle_ms(2);
+	esp_err_t release = electrodes_high_impedance();
+	return err != ESP_OK ? err : release;
 }
 
 static void calibration_try_init(void)
@@ -83,43 +100,25 @@ static void calibration_try_init(void)
 		 "ADC calibration unavailable; approximate raw-to-mV fallback is active");
 }
 
-static esp_err_t measure_direction(bool drive_a, int *voltage_mv,
+static esp_err_t read_voltage(adc_channel_t sense_channel, int *voltage_mv,
 				   bool *used_calibration)
 {
 	if (!voltage_mv || !used_calibration) {
 		return ESP_ERR_INVALID_ARG;
 	}
 
-	electrodes_high_impedance();
-	gpio_num_t drive_gpio = drive_a ? s_sensor.config.electrode_a_gpio
-					 : s_sensor.config.electrode_b_gpio;
-	adc_channel_t sense_channel = drive_a ? s_sensor.channel_b
-					      : s_sensor.channel_a;
-
-	esp_err_t err = gpio_set_direction(drive_gpio, GPIO_MODE_OUTPUT);
-	if (err != ESP_OK) {
-		return err;
-	}
-	err = gpio_set_level(drive_gpio, 1);
-	if (err != ESP_OK) {
-		electrodes_high_impedance();
-		return err;
-	}
-	vTaskDelay(pdMS_TO_TICKS(5));
-
+	esp_err_t err;
 	int64_t raw_sum = 0;
 	for (int i = 0; i < SENSOR_SAMPLE_COUNT; ++i) {
 		int raw = 0;
 		err = adc_oneshot_read(s_sensor.adc, sense_channel, &raw);
 		if (err != ESP_OK) {
-			electrodes_discharge();
 			return err;
 		}
 		raw_sum += raw;
-		vTaskDelay(pdMS_TO_TICKS(2));
+		if (i + 1 < SENSOR_SAMPLE_COUNT) settle_ms(2);
 	}
 
-	electrodes_discharge();
 	int average_raw = (int)(raw_sum / SENSOR_SAMPLE_COUNT);
 	if (s_sensor.calibration_available && s_sensor.calibration) {
 		err = adc_cali_raw_to_voltage(s_sensor.calibration, average_raw,
@@ -141,15 +140,36 @@ static esp_err_t measure_direction(bool drive_a, int *voltage_mv,
 	return ESP_OK;
 }
 
-static pump_level_state_t classify_voltage(int voltage_mv)
+static esp_err_t measure_direction(bool drive_a, int *high_mv, int *low_mv,
+                                  bool *calibrated)
 {
-	if (voltage_mv >= s_sensor.config.wet_threshold_mv) {
-		return PUMP_LEVEL_WET;
+	gpio_num_t drive_gpio = drive_a ? s_sensor.config.electrode_a_gpio
+	                              : s_sensor.config.electrode_b_gpio;
+	adc_channel_t channel = drive_a ? s_sensor.channel_b : s_sensor.channel_a;
+	adc_oneshot_chan_cfg_t config = {
+		.bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_11,
+	};
+	bool high_cal = false, low_cal = false;
+	esp_err_t err = electrodes_discharge();
+	/* Restore analog input after the previous discharge used this pad as GPIO. */
+	if (err == ESP_OK) err = adc_oneshot_config_channel(s_sensor.adc, channel, &config);
+	if (err == ESP_OK) err = gpio_set_direction(drive_gpio, GPIO_MODE_OUTPUT);
+	if (err == ESP_OK) err = gpio_set_level(drive_gpio, 1);
+	if (err == ESP_OK) {
+		settle_ms(5);
+		err = read_voltage(channel, high_mv, &high_cal);
 	}
-	if (voltage_mv <= s_sensor.config.dry_threshold_mv) {
-		return PUMP_LEVEL_DRY;
+	/* The normal excitation must also disappear when its driver returns LOW. */
+	esp_err_t low_err = gpio_set_level(drive_gpio, 0);
+	if (err == ESP_OK) err = low_err;
+	if (err == ESP_OK) {
+		settle_ms(5);
+		err = read_voltage(channel, low_mv, &low_cal);
 	}
-	return PUMP_LEVEL_UNKNOWN;
+	esp_err_t cleanup = electrodes_discharge();
+	if (err == ESP_OK) err = cleanup;
+	*calibrated = high_cal && low_cal;
+	return err;
 }
 
 esp_err_t water_level_sensor_init(const water_level_sensor_config_t *config)
@@ -188,7 +208,8 @@ esp_err_t water_level_sensor_init(const water_level_sensor_config_t *config)
 	}
 	s_sensor.unit = unit_a;
 
-	electrodes_high_impedance();
+	err = electrodes_high_impedance();
+	if (err != ESP_OK) return err;
 	adc_oneshot_unit_init_cfg_t unit_config = {
 		.unit_id = s_sensor.unit,
 		.ulp_mode = ADC_ULP_MODE_DISABLE,
@@ -225,6 +246,10 @@ esp_err_t water_level_sensor_read(water_level_snapshot_t *snapshot)
 	}
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->state = PUMP_LEVEL_UNKNOWN;
+	snapshot->test_flags = WATER_TEST_IO;
+	snapshot->test_enforced = CONFIG_CHOINKA_ELECTRODE_TEST_ENFORCE;
+	snapshot->low_ab_mv = -1;
+	snapshot->low_ba_mv = -1;
 	if (!s_sensor.initialized) {
 		snapshot->error = ESP_ERR_INVALID_STATE;
 		return snapshot->error;
@@ -232,10 +257,10 @@ esp_err_t water_level_sensor_read(water_level_snapshot_t *snapshot)
 
 	bool calibrated_ab = false;
 	bool calibrated_ba = false;
-	esp_err_t err = measure_direction(true, &snapshot->voltage_ab_mv,
+	esp_err_t err = measure_direction(true, &snapshot->voltage_ab_mv, &snapshot->low_ab_mv,
 					  &calibrated_ab);
 	if (err == ESP_OK) {
-		err = measure_direction(false, &snapshot->voltage_ba_mv,
+		err = measure_direction(false, &snapshot->voltage_ba_mv, &snapshot->low_ba_mv,
 					&calibrated_ba);
 	}
 	if (err != ESP_OK) {
@@ -244,13 +269,14 @@ esp_err_t water_level_sensor_read(water_level_snapshot_t *snapshot)
 		return err;
 	}
 
-	pump_level_state_t state_ab = classify_voltage(snapshot->voltage_ab_mv);
-	pump_level_state_t state_ba = classify_voltage(snapshot->voltage_ba_mv);
-	if (state_ab == PUMP_LEVEL_WET || state_ba == PUMP_LEVEL_WET) {
-		snapshot->state = PUMP_LEVEL_WET;
-	} else if (state_ab == PUMP_LEVEL_DRY && state_ba == PUMP_LEVEL_DRY) {
-		snapshot->state = PUMP_LEVEL_DRY;
-	}
+	snapshot->test_flags = water_level_health_check(
+		snapshot->voltage_ab_mv, snapshot->voltage_ba_mv,
+		snapshot->low_ab_mv, snapshot->low_ba_mv,
+		s_sensor.config.dry_threshold_mv, s_sensor.config.wet_threshold_mv,
+		&snapshot->state);
+	snapshot->state = water_level_control_state(snapshot->voltage_ab_mv,
+		snapshot->voltage_ba_mv, s_sensor.config.dry_threshold_mv,
+		s_sensor.config.wet_threshold_mv, snapshot->test_flags, snapshot->test_enforced);
 	snapshot->calibrated = calibrated_ab && calibrated_ba;
 	snapshot->approximate_fallback = !snapshot->calibrated;
 	snapshot->error = ESP_OK;

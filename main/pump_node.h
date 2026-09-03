@@ -23,6 +23,10 @@ typedef struct {
 	pump_level_state_t level_state;
 	int voltage_ab_mv;
 	int voltage_ba_mv;
+	int sensor_low_ab_mv;
+	int sensor_low_ba_mv;
+	uint8_t sensor_test_flags;
+	bool sensor_test_enforced;
 	bool adc_calibrated;
 	bool approximate_fallback;
 	bool pump_on;

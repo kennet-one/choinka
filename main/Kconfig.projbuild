@@ -181,6 +181,15 @@ menu "Example Configuration"
             range 1 20
             default 3
 
+        config CHOINKA_ELECTRODE_TEST_ENFORCE
+            bool "Use electrode plausibility faults as pump interlocks"
+            default n
+            help
+                Leave disabled until wet/dry and LOW-phase measurements have
+                been validated on this board. Diagnostics are always reported.
+                Disabled preserves the established HIGH-phase classification;
+                GPIO/ADC errors, UNKNOWN, D4 and the run timer still stop pumping.
+
         config CHOINKA_LEVEL_WET_CONFIRM_CYCLES
             int "Consecutive wet samples before stopping"
             range 1 20

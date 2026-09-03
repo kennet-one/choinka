@@ -6,6 +6,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "pump_controller.h"
+#include "water_level_health.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,10 @@ typedef struct {
 	pump_level_state_t state;
 	int voltage_ab_mv;
 	int voltage_ba_mv;
+	int low_ab_mv;
+	int low_ba_mv;
+	uint8_t test_flags;
+	bool test_enforced;
 	bool calibrated;
 	bool approximate_fallback;
 	esp_err_t error;

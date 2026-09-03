@@ -258,6 +258,10 @@ static void publish_status(const water_level_snapshot_t *sensor,
 		.level_state = sensor ? sensor->state : PUMP_LEVEL_UNKNOWN,
 		.voltage_ab_mv = sensor ? sensor->voltage_ab_mv : 0,
 		.voltage_ba_mv = sensor ? sensor->voltage_ba_mv : 0,
+		.sensor_low_ab_mv = sensor ? sensor->low_ab_mv : -1,
+		.sensor_low_ba_mv = sensor ? sensor->low_ba_mv : -1,
+		.sensor_test_flags = sensor ? sensor->test_flags : WATER_TEST_IO,
+		.sensor_test_enforced = sensor && sensor->test_enforced,
 		.adc_calibrated = sensor && sensor->calibrated,
 		.approximate_fallback = sensor && sensor->approximate_fallback,
 		.pump_on = s_pump.controller.pump_on && pump_driver_is_enabled(),
@@ -293,6 +297,11 @@ static void log_state_change(const pump_node_status_t *before,
 			 pump_node_level_name(after->level_state),
 			 after->voltage_ab_mv, after->voltage_ba_mv,
 			 after->adc_calibrated ? 1U : 0U);
+	}
+	if (before->sensor_test_flags != after->sensor_test_flags) {
+		ESP_LOGW(TAG, "electrode test flags:%u low:%d/%d mV; not a cable-continuity test",
+		         after->sensor_test_flags, after->sensor_low_ab_mv,
+		         after->sensor_low_ba_mv);
 	}
 	if (before->pump_on != after->pump_on) {
 		ESP_LOGI(TAG, "pump %s, reason:%s timeout_count:%" PRIu32,
@@ -503,6 +512,8 @@ esp_err_t pump_node_init(const pump_node_pins_t *pins)
 	s_pump.initialized = true;
 	water_level_snapshot_t initial_sensor = {
 		.state = PUMP_LEVEL_UNKNOWN,
+		.test_flags = WATER_TEST_IO,
+		.low_ab_mv = -1, .low_ba_mv = -1,
 	};
 	publish_status(&initial_sensor, ESP_OK, current_ms);
 

@@ -109,18 +109,25 @@ bool keemash_mesh_node_on_control_command_result(const char *text, uint8_t *stat
 		*status = MESH_V2_CONTROL_STATUS_OK;
 	}
 	if (result && result_size > 0) {
-		snprintf(result, result_size,
-		         "exec=%lu level=%s pump=%u block=%u mv=%d/%d cal=%u cd=%lu stop=%s tout=%lu last=%lld",
+		int length = snprintf(result, result_size,
+		         "C6 exec=%lu l=%u p=%u b=%u v=%d/%d c=%u d=%lu s=%u t=%lu a=%lld x=%u z=%d/%d m=%u",
 		         (unsigned long)s_status_command_exec_count,
-		         pump_node_level_name(pump_status.level_state),
+		         (unsigned)pump_status.level_state,
 		         pump_status.pump_on ? 1U : 0U,
 		         pump_status.hardware_blocked ? 1U : 0U,
 		         pump_status.voltage_ab_mv, pump_status.voltage_ba_mv,
 		         pump_status.adc_calibrated ? 1U : 0U,
 		         (unsigned long)pump_status.cooldown_remaining_ms,
-		         pump_node_stop_reason_name(pump_status.last_stop_reason),
+		         (unsigned)pump_status.last_stop_reason,
 		         (unsigned long)pump_status.timeout_count,
-		         (long long)pump_status.last_start_age_s);
+		         (long long)pump_status.last_start_age_s,
+		         pump_status.sensor_test_flags,
+		         pump_status.sensor_low_ab_mv, pump_status.sensor_low_ba_mv,
+		         pump_status.sensor_test_enforced ? 1U : 0U);
+		if (length < 0 || (size_t)length >= result_size) {
+			if (status) *status = MESH_V2_CONTROL_STATUS_FAILED;
+			snprintf(result, result_size, "pump status exceeds response capacity");
+		}
 		result[result_size - 1] = '\0';
 	}
 	return true;
