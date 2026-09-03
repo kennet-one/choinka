@@ -547,6 +547,7 @@ bool pump_node_get_status(pump_node_status_t *status)
 	}
 	*status = s_pump.status;
 	xSemaphoreGive(s_pump.status_mutex);
+	status->last_start_age_s = pump_driver_last_start_age_s();
 	return true;
 }
 

@@ -28,6 +28,7 @@ typedef struct {
 	bool pump_on;
 	bool hardware_blocked;
 	uint32_t pump_run_ms;
+	int64_t last_start_age_s;
 	uint32_t cooldown_remaining_ms;
 	uint32_t timeout_count;
 	uint8_t dry_streak;

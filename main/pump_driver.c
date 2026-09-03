@@ -3,11 +3,14 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "esp_timer.h"
 
 typedef struct {
 	bool initialized;
 	bool active_high;
 	bool enabled;
+	bool has_started;
+	int64_t last_started_us;
 	gpio_num_t gpio;
 	gpio_num_t block_gpio;
 } pump_driver_context_t;
@@ -95,6 +98,10 @@ esp_err_t pump_driver_set(bool enabled)
 	bool applied_enabled = enabled && !blocked;
 	err = gpio_set_level(s_driver.gpio, output_level(applied_enabled));
 	if (err == ESP_OK) {
+		if (applied_enabled && !s_driver.enabled) {
+			s_driver.last_started_us = esp_timer_get_time();
+			s_driver.has_started = true;
+		}
 		s_driver.enabled = applied_enabled;
 		if (blocked) {
 			err = ESP_ERR_INVALID_STATE;
@@ -110,6 +117,15 @@ bool pump_driver_is_enabled(void)
 	bool enabled = s_driver.initialized && s_driver.enabled;
 	portEXIT_CRITICAL(&s_driver_lock);
 	return enabled;
+}
+
+int64_t pump_driver_last_start_age_s(void)
+{
+	portENTER_CRITICAL(&s_driver_lock);
+	int64_t age = s_driver.has_started
+		? (esp_timer_get_time() - s_driver.last_started_us) / 1000000 : -1;
+	portEXIT_CRITICAL(&s_driver_lock);
+	return age;
 }
 
 bool pump_driver_is_hardware_blocked(void)
