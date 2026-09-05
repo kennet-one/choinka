@@ -28,6 +28,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Host test compilation failed.' }
     & (Join-Path $output 'pump-host-test.exe')
     if ($LASTEXITCODE -ne 0) { throw 'Pump host tests failed.' }
+    & cl.exe /nologo /std:c11 /W4 /WX "/I$root\main" "$root\tests\mesh_recovery_clock_test.c" /Fe:mesh-recovery-clock-test.exe
+    if ($LASTEXITCODE -ne 0) { throw 'Recovery clock test compilation failed.' }
+    & (Join-Path $output 'mesh-recovery-clock-test.exe')
+    if ($LASTEXITCODE -ne 0) { throw 'Recovery clock tests failed.' }
 } finally {
     Pop-Location
 }

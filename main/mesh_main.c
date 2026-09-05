@@ -27,6 +27,7 @@
 #include "mesh_log_stream.h"
 #include "mesh_ota_receiver.h"
 #include "mesh_v2_link.h"
+#include "mesh_recovery_clock.h"
 #include "keemash_mesh_hooks.h"
 
 /* -------------------------------------------------------------------------- */
@@ -386,14 +387,15 @@ static void update_v2_topology(bool send_now)
 
 static void note_mesh_disconnected(void)
 {
+	uint32_t now = tick_ms();
 	if (is_mesh_connected || s_disconnected_since_ms == 0) {
-		s_disconnected_since_ms = tick_ms();
+		s_disconnected_since_ms = mesh_recovery_clock_start(0, now);
 	}
 	is_mesh_connected = false;
-	s_root_recovery_phase = ROOT_RECOVERY_OK;
-	mesh_v2_node_set_recovery_phase((uint8_t)ROOT_RECOVERY_OK);
+	s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
+	mesh_v2_node_set_recovery_phase((uint8_t)s_root_recovery_phase);
 	mesh_log_stream_clear_tx_accepted();
-	s_root_unhealthy_since_ms = 0;
+	s_root_unhealthy_since_ms = mesh_recovery_clock_start(s_root_unhealthy_since_ms, now);
 	s_last_root_burst_ms = 0;
 	s_last_root_rx_ms = 0;
 }
@@ -405,11 +407,8 @@ static void note_mesh_connected(void)
 	s_last_reconnect_attempt_ms = 0;
 	s_root_recovery_phase = ROOT_RECOVERY_WAIT_ACK;
 	mesh_v2_node_set_recovery_phase((uint8_t)s_root_recovery_phase);
-	s_root_unhealthy_since_ms = tick_ms();
+	s_root_unhealthy_since_ms = mesh_recovery_clock_start(s_root_unhealthy_since_ms, tick_ms());
 	s_last_root_burst_ms = 0;
-	s_last_root_soft_reconnect_ms = 0;
-	s_last_root_hard_restart_ms = 0;
-	s_last_root_recovery_log_ms = 0;
 }
 
 static const char *root_recovery_phase_name(root_recovery_phase_t phase)
@@ -1036,6 +1035,7 @@ static void root_liveness_watchdog_step(void)
 	    (s_last_root_hard_restart_ms == 0 ||
 	     (uint32_t)(now - s_last_root_hard_restart_ms) >= ROOT_RECOVERY_HARD_MS)) {
 		s_last_root_hard_restart_ms = now;
+		s_last_mesh_restart_ms = now;
 		s_mesh_restart_count++;
 		s_last_recovery_reason = MESH_V2_RECOVERY_REASON_MESH_RESTART;
 		diag_note_recovery_action(now, ESP_OK);
@@ -1106,9 +1106,14 @@ static void mesh_reconnect_watchdog_task(void *arg)
 		}
 
 		uint32_t down_ms = (uint32_t)(now - s_disconnected_since_ms);
+		if (s_root_unhealthy_since_ms != 0 &&
+		    (uint32_t)(now - s_root_unhealthy_since_ms) > down_ms) {
+			down_ms = (uint32_t)(now - s_root_unhealthy_since_ms);
+		}
 		if (down_ms >= MESH_RECONNECT_HARD_MS &&
 		    (uint32_t)(now - s_last_mesh_restart_ms) >= MESH_RECONNECT_HARD_MS) {
 			s_last_mesh_restart_ms = now;
+			s_last_root_hard_restart_ms = now;
 			s_last_reconnect_attempt_ms = now;
 			s_mesh_restart_count++;
 			s_last_recovery_reason = MESH_V2_RECOVERY_REASON_MESH_RESTART;
@@ -1247,12 +1252,8 @@ static void mesh_event_handler(void *arg,
 		note_mesh_disconnected();
 		mesh_v2_node_on_mesh_disconnected();
 		mesh_log_stream_on_mesh_disconnected();
-		if (now > MESH_RECONNECT_SOFT_MS) {
-			s_disconnected_since_ms = now - MESH_RECONNECT_SOFT_MS;
-		} else {
-			s_disconnected_since_ms = 1;
-		}
-		s_last_reconnect_attempt_ms = 0;
+		s_disconnected_since_ms = mesh_recovery_clock_expedite(
+		    s_disconnected_since_ms, now, MESH_RECONNECT_SOFT_MS);
 		(void)esp_mesh_flush_scan_result();
 	}
 	break;
