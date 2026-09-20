@@ -46,7 +46,6 @@
 #define ROOT_RECOVERY_SOFT_MS   20000U
 #define ROOT_RECOVERY_HARD_MS   45000U
 #define ROOT_RECOVERY_LOG_MS    15000U
-#define MESH_SERVICE_STOP_RETRY_MS   10000U
 #define MESH_SERVICE_STOP_TIMEOUT_MS 30000U
 #define MANUAL_REBOOT_DELAY_MIN_MS 500U
 #define MANUAL_REBOOT_DELAY_MAX_MS 5000U
@@ -897,10 +896,19 @@ static esp_err_t mesh_service_request_restart(uint32_t now)
 	s_mesh_service_stop_started_ms = now;
 	esp_err_t err = esp_mesh_stop();
 	diag_note_send_err(err);
-	if (err != ESP_OK) {
+	if (err == ESP_ERR_MESH_NOT_START) {
+		/* A stopped-service result is the only synchronous proof that start is safe. */
+		s_mesh_service_started = false;
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		s_mesh_service_action_ms = 0;
+		s_mesh_service_stop_started_ms = 0;
+		diag_note_send_err(ESP_OK);
+		err = ESP_OK;
+	} else if (err != ESP_OK) {
 		ESP_LOGW(MESH_TAG, "mesh service stop request failed: %s",
 			 esp_err_to_name(err));
-		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+		/* Keep the observed started state. Starting over a live service can wedge it. */
+		s_mesh_service_recovery = MESH_SERVICE_RECOVERY_IDLE;
 		s_mesh_service_action_ms = 0;
 		s_mesh_service_stop_started_ms = 0;
 	}
@@ -926,31 +934,18 @@ static bool mesh_service_recovery_step(uint32_t now)
 		           (uint32_t)(now - s_mesh_service_stop_started_ms) >=
 		           MESH_SERVICE_STOP_TIMEOUT_MS) {
 			ESP_LOGW(MESH_TAG,
-			         "mesh service stop timeout after %lu ms; forcing local restart state",
+			         "mesh service stop timeout after %lu ms; keeping observed started state",
 			         (unsigned long)(uint32_t)(now - s_mesh_service_stop_started_ms));
-			mesh_v2_node_on_mesh_disconnected();
-			mesh_log_stream_on_mesh_disconnected();
-			note_mesh_disconnected();
-			s_mesh_service_started = false;
-			s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
+			/*
+			 * ESP-MESH owns the asynchronous stop transition. If STOPPED was not
+			 * observed, pretending it happened makes every later esp_mesh_start()
+			 * race a still-running service. Return to soft reconnect recovery and
+			 * let a late STOPPED event or a later bounded restart attempt decide.
+			 */
+			s_mesh_service_recovery = MESH_SERVICE_RECOVERY_IDLE;
 			s_mesh_service_action_ms = 0;
 			s_mesh_service_stop_started_ms = 0;
-		} else if ((uint32_t)(now - s_mesh_service_action_ms) >=
-		           MESH_SERVICE_STOP_RETRY_MS) {
-			s_mesh_service_action_ms = now;
-			esp_err_t err = esp_mesh_stop();
-			diag_note_send_err(err);
-			if (err != ESP_OK) {
-				ESP_LOGW(MESH_TAG, "mesh service stop retry failed: %s",
-					 esp_err_to_name(err));
-				if (err == ESP_ERR_MESH_NOT_START ||
-				    err == ESP_ERR_INVALID_STATE) {
-					s_mesh_service_started = false;
-					s_mesh_service_recovery = MESH_SERVICE_RECOVERY_STARTING;
-					s_mesh_service_action_ms = 0;
-					s_mesh_service_stop_started_ms = 0;
-				}
-			}
+			return false;
 		}
 		return true;
 	}
