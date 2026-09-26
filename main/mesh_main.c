@@ -29,6 +29,7 @@
 #include "mesh_v2_link.h"
 #include "mesh_recovery_clock.h"
 #include "keemash_mesh_hooks.h"
+#include "keemash_mesh_network.h"
 
 /* -------------------------------------------------------------------------- */
 /*  Constants / globals                                                       */
@@ -728,7 +729,7 @@ static esp_err_t mesh_service_init_and_start(void)
 		s_mesh_library_initialized = true;
 	}
 
-	err = esp_mesh_fix_root(false);
+	err = keemash_mesh_apply_single_root_policy(KEEMASH_MESH_ROLE_NODE);
 	if (err != ESP_OK) return err;
 	err = esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY);
 	if (err != ESP_OK) return err;
